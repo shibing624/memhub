@@ -105,8 +105,7 @@ async def test_embed_batch_usage_callback():
 
 @respx.mock
 async def test_embed_batch_long_text_head_truncated():
-    max_chars = int(EMBED_MAX_TOKENS * EMBED_CHARS_PER_TOKEN)
-    long_text = "x" * (max_chars + 2000)
+    long_text = "徐" * (EMBED_MAX_TOKENS + 100)
     captured: dict = {}
 
     def _record_request(request: httpx.Request) -> httpx.Response:
@@ -126,11 +125,13 @@ async def test_embed_batch_long_text_head_truncated():
         input_max_tokens=EMBED_MAX_TOKENS,
         chars_per_token=EMBED_CHARS_PER_TOKEN,
     )
+    max_bytes = svc.input_max_bytes
     vecs = await svc.embed_batch([long_text, "hi"])
-    # Head-truncated, NOT chunked: exactly one input per text, no extra chunk rows.
     sent = captured["json"]["input"]
     assert len(sent) == 2
-    assert len(sent[0]) == max_chars
+    assert len(sent[0].encode("utf-8")) <= max_bytes
+    assert len(sent[0].encode("utf-8")) < len(long_text.encode("utf-8"))
+    assert sent[0] == long_text[: len(sent[0])]
     assert sent[1] == "hi"
     assert len(vecs) == 2
     assert len(vecs[0]) == 4
@@ -145,16 +146,31 @@ def test_embed_max_tokens_derived_char_budget():
         chars_per_token=2.5,
     )
     assert svc.input_max_chars == 20480
+    assert svc.input_max_bytes == 8192
+    assert svc.input_max_bytes <= svc.input_max_tokens
     assert svc.input_max_tokens == 8192
 
 
 def test_default_embed_budget_fits_dense_text_under_the_token_limit():
-    """Dense CJK/code runs near 1.2 chars/token; the default char cap must
-    keep such text under ``embed_max_tokens`` (the provider rejects, not cuts)."""
-    from memhub.config import Settings
+    """The byte cap really keeps dense Unicode within cl100k_base's token limit.
 
-    s = Settings()
-    assert s.embed_input_max_chars / 1.21 <= s.embed_max_tokens
+    Character-only truncation used to send more tokens than the configured limit.
+    """
+    tiktoken = pytest.importorskip("tiktoken", reason="requires tiktoken tokenizer")
+    encoding = tiktoken.get_encoding("cl100k_base")
+    svc = EmbedService(
+        base_url="https://api.test/v1",
+        api_key="sk-x",
+        model="embed-test",
+        input_max_tokens=8192,
+        chars_per_token=2.5,
+    )
+    for dense_text in ("徐" * 10_000, "\U00010000" * 10_000, "a!?~" * 10_000):
+        chopped = svc._truncate_for_embedding(
+            dense_text, svc.input_max_chars, svc.input_max_bytes
+        )
+        assert len(chopped.encode("utf-8")) <= svc.input_max_bytes
+        assert len(encoding.encode(chopped)) <= svc.input_max_tokens
 
 
 @respx.mock

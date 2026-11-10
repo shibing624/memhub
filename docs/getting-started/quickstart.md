@@ -294,6 +294,6 @@ REST 契约：`POST /v1/memories/`、`POST /v1/memories/search`、`GET|DELETE /v
 |---|---|---|
 | `reconcile_relation_threshold` | `0.6` | 新记忆与已有记忆的相似度达到阈值，才请决策模型判断"重复 / 更新 / 新增"；低于阈值直接新增 |
 | `procedure_source_max_chars` | `24000` | coding 会话送入 procedure 抽取与 JEV 裁决的对话字符预算（优先保留用户消息） |
-| `embed_chars_per_token` | `1.2` | Embedding 输入字符上限的换算系数（`embed_max_tokens × 1.2`），兼容代码与日志密集文本，防止超出上游 8192 token 限制 |
+| `embed_chars_per_token` | `1.2` | Embedding 输入字符上限的换算系数（`embed_max_tokens × 1.2`）；另按 `embed_max_tokens` 个 UTF-8 字节封顶，兼容中文、emoji 与代码混排文本，防止超出上游 token 限制 |
 
 在意决策模型费用时可以设成 `0.7`：调用次数少约 27%，写入时间少约 10%，评测上没有测到掉分。

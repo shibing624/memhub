@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **修复长对话写入 embedding 超上游 token 上限**：原先只按 `embed_max_tokens × embed_chars_per_token` 截字符，中文、emoji 和代码混排时字符/token 比会低于估算值，截后的输入仍可能超过上游限制并被拒绝。现在额外按 UTF-8 字节数封顶（`≤ embed_max_tokens` 字节），字节级 BPE 下每个 token 至少覆盖一字节，因此截断输入不会超 `embed_max_tokens`；完整原文仍保留在 L0_RAW 并用于抽取。
 - **项目标识归一化（Git Worktree / 子模块 / 子目录 / 跨机器 Remote 对齐）**：
   - `memhub.hub.browse` 新增 `canonical_workspace`、`resolve_workspace_root`、`git_remote_slug` 与 `parse_origin_slug`：无需派生 `git` 子进程即可直接解析 `.git` 目录或文件（支持 linked `git worktree`、`git submodule`、bare worktree），将任意子目录或 worktree 路径自动归并到主仓库根目录。
   - 跨机器同步召回时，`workspace_sessions` 同时按主仓库路径、`.git/config` 的 `origin` 远端 `org/repo` slug，以及远端机器不存在于本机的同名 Git 仓库目录名做匹配，解决多 worktree 并发开发或两台电脑克隆路径不同导致按项目召回割裂的问题。

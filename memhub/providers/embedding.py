@@ -63,6 +63,10 @@ class EmbedService:
         self.input_max_tokens = input_max_tokens
         self.chars_per_token = chars_per_token
         self.input_max_chars = int(input_max_tokens * chars_per_token)
+        # cl100k_base can spend four tokens on one Unicode codepoint and each
+        # UTF-8 byte can contribute a token. Byte truncation therefore has a
+        # tokenizer-independent upper bound on the number of tokens sent.
+        self.input_max_bytes = input_max_tokens
         self.usage_callback = usage_callback
         self._api_dimensions = embedding_api_dimensions(model, dim)
         if self._api_dimensions is None:
@@ -133,31 +137,44 @@ class EmbedService:
             ))
         return vectors
 
+    @staticmethod
+    def _truncate_for_embedding(text: str, max_chars: int, max_bytes: int) -> str:
+        head = text[:max_chars] if max_chars > 0 else text
+        raw = head.encode("utf-8")
+        if max_bytes > 0 and len(raw) > max_bytes:
+            return raw[:max_bytes].decode("utf-8", errors="ignore")
+        return head
+
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of texts and return one vector per input; empty list short-circuits.
 
-        Texts longer than ``embed_max_tokens`` (via char budget) are head-truncated to the
-        budget before the API call. Full source documents remain stored and are passed
-        to candidate generation; raw anchors are excluded from normal recall.
+        Long texts are head-truncated to both a character and UTF-8 byte budget before
+        the API call. Full source documents remain stored and are passed to candidate
+        generation; raw anchors are excluded from normal recall.
         """
         if not texts:
             return []
         max_chars = self.input_max_chars
+        max_bytes = self.input_max_bytes
         prepared: list[str] = []
         n_truncated = 0
         for t in texts:
-            if max_chars > 0 and len(t) > max_chars:
-                prepared.append(t[:max_chars])
+            if (max_chars > 0 and len(t) > max_chars) or (
+                max_bytes > 0 and len(t.encode("utf-8")) > max_bytes
+            ):
+                prepared.append(self._truncate_for_embedding(t, max_chars, max_bytes))
                 n_truncated += 1
             else:
                 prepared.append(t)
         if n_truncated:
             logger.info(
                 "embed_batch: %d of %d inputs over limit, head-truncated to ~%d chars "
-                "(≈%d tokens); raw L1 anchors only, full text kept for extraction",
+                "and %d UTF-8 bytes (≈%d tokens); raw L1 anchors only, full text "
+                "kept for extraction",
                 n_truncated,
                 len(texts),
                 max_chars,
+                max_bytes,
                 self.input_max_tokens,
             )
         return await self._embed_prepared_batch(prepared)
