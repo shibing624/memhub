@@ -41,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -57,6 +58,8 @@ from memhub.client import strip_memory_injection
 from memhub.hub.browse import canonical_workspace
 from memhub.hub.config import CursorStore
 from memhub.hub.redact import sanitize_text, strip_image_payloads
+
+logger = logging.getLogger(__name__)
 
 SOURCES = (
     "agentica",
@@ -104,6 +107,11 @@ _CURSOR_TIME_RE = re.compile(
 # Tool arguments that carry a file's text: output, not memory material. A
 # string input (``ApplyPatch``) is a whole patch and is dropped the same way.
 _CURSOR_WRITE_KEYS = ("contents", "old_string", "new_string")
+
+
+class TranscriptError(RuntimeError):
+    """A host transcript this reader cannot parse (half-written, or a shape it does
+    not know). Raised by ``scan_file``; ``scan_sources`` skips the file and goes on."""
 
 
 class HubWriter(Protocol):
@@ -1099,12 +1107,20 @@ async def scan_file(
     one session is one write with a content-derived request id. The cursor moves
     only past batches the Core holds durably; an unreachable Core raises and the
     next scan resends from there (same ids, so nothing is stored twice).
+
+    A transcript the reader cannot parse raises ``TranscriptError`` with the cursor
+    unmoved: a half-written file parses on a later scan.
     """
     spec = SOURCE_SPECS[source]
     key = str(path.resolve())
     with cursors.lock(source, key):
         cursor = cursors.get(source, key)
-        messages, reached = spec.read(path, cursor.position if cursor else 0)
+        try:
+            messages, reached = spec.read(path, cursor.position if cursor else 0)
+        except Exception as exc:
+            # Host formats are third-party and rewritten in place; whatever the
+            # parser trips on is a property of this file, not of the scan.
+            raise TranscriptError(f"{source} {path}: {type(exc).__name__}: {exc}") from exc
         turns, open_turn = build_turns(messages)
         ended = complete or time.time() - path.stat().st_mtime >= idle_seconds
         if open_turn and open_turn.assistant and ended:
@@ -1154,7 +1170,11 @@ async def scan_sources(
     max_turns: int = 0,
     **scan_kwargs: Any,
 ) -> dict[str, dict[str, int]]:
-    """Scan every transcript of ``sources``; ``max_turns`` caps this run in total."""
+    """Scan every transcript of ``sources``; ``max_turns`` caps this run in total.
+
+    A transcript that cannot be parsed is skipped and counted in ``errors``; the
+    other files are still ingested. An unreachable Core still aborts the scan.
+    """
     roots = roots or default_source_roots()
     summary: dict[str, dict[str, int]] = {}
     remaining = max_turns
@@ -1162,20 +1182,26 @@ async def scan_sources(
         for source in sources or SOURCES:
             files = SOURCE_SPECS[source].discover(roots[source]) if roots[source].exists() else []
             written = 0
+            errors = 0
             for path in files:
                 if max_turns and remaining <= 0:
                     break
-                n = await scan_file(
-                    client,
-                    source=source,
-                    path=path,
-                    cursors=cursors,
-                    max_turns=remaining if max_turns else 0,
-                    **scan_kwargs,
-                )
+                try:
+                    n = await scan_file(
+                        client,
+                        source=source,
+                        path=path,
+                        cursors=cursors,
+                        max_turns=remaining if max_turns else 0,
+                        **scan_kwargs,
+                    )
+                except TranscriptError as exc:
+                    logger.warning("skipped unreadable transcript: %s", exc)
+                    errors += 1
+                    continue
                 written += n
                 remaining -= n
-            summary[source] = {"files": len(files), "turns": written}
+            summary[source] = {"files": len(files), "turns": written, "errors": errors}
     return summary
 
 

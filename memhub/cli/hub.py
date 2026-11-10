@@ -535,7 +535,6 @@ def _capture_inline(source: str, payload: dict[str, Any], hub_dir: str | None) -
     if path is None or not path.is_file():
         return
     pending = json.loads(path.read_text(encoding="utf-8"))
-    path.unlink()
     answer = payload.get("last_assistant_message", "").strip()
     messages = [{"role": "user", "content": pending["prompt"]}]
     if answer:
@@ -553,6 +552,9 @@ def _capture_inline(source: str, payload: dict[str, Any], hub_dir: str | None) -
             )
 
     asyncio.run(write())
+    # Only once the Core holds the turn: if the write raises, the prompt stays and
+    # a repeated Stop of this turn still has it (same request id, stored once).
+    path.unlink()
 
 
 def _when(item: dict[str, Any]) -> str:
@@ -934,8 +936,25 @@ def run_doctor(hub_dir: str | Path | None = None) -> dict[str, Any]:
         )
 
     # 4. Sync configuration and status.
-    sync_cfg = load_sync_config(root)
-    if sync_cfg is None:
+    try:
+        sync_cfg = load_sync_config(root)
+        sync_cfg_error = None
+    except (ValueError, KeyError, TypeError) as exc:
+        sync_cfg = None
+        sync_cfg_error = f"{type(exc).__name__}: {exc}"
+    if sync_cfg_error is not None:
+        checks.append(
+            {
+                "name": "Sync target",
+                "status": "fail",
+                "detail": (
+                    f"hub.json is invalid ({_one_line(sync_cfg_error, 160)}) — "
+                    "run `memhub connect` again or `memhub disconnect`"
+                ),
+                "required": False,
+            }
+        )
+    elif sync_cfg is None:
         checks.append(
             {
                 "name": "Sync target",
@@ -963,6 +982,19 @@ def run_doctor(hub_dir: str | Path | None = None) -> dict[str, Any]:
     # 5. Detected AI hosts and wiring status.
     detected = hub_hosts.detect_installed_hosts()
     h_status = hub_hosts.hosts_status()
+    broken = [h for h in detected if h_status[h].get("error")]
+    if broken:
+        checks.append(
+            {
+                "name": "Host configs",
+                "status": "warn",
+                "detail": "; ".join(
+                    f"{h}: {_one_line(h_status[h]['error'], 120)}" for h in broken
+                )
+                + " — fix the file, then run `memhub install-host`",
+                "required": False,
+            }
+        )
     wired = [
         h
         for h in detected

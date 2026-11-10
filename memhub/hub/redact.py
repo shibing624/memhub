@@ -79,7 +79,9 @@ BUILTIN_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "private_key_pem",
         re.compile(
             r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----"
-            r"[\s\S]*?"
+            # Never past the next BEGIN: with many unclosed headers a plain lazy
+            # ``[\s\S]*?`` rescans to the end from each one (quadratic).
+            r"(?:(?!-----BEGIN )[\s\S])*?"
             r"-----END (?:RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----"
         ),
     ),
@@ -260,6 +262,22 @@ def sanitize_text(text: str, *, redact: bool = False) -> str:
     return redact_secrets(cleaned) if redact else cleaned
 
 
+def _sanitize_value(value: Any, *, redact: bool, _depth: int = 0) -> Any:
+    """``sanitize_text`` applied to every string inside content blocks / tool args."""
+    if isinstance(value, str):
+        return sanitize_text(value, redact=redact)
+    if _depth > _MAX_SANITIZE_DEPTH:
+        return value
+    if isinstance(value, list):
+        return [_sanitize_value(v, redact=redact, _depth=_depth + 1) for v in value]
+    if isinstance(value, dict):
+        return {
+            k: _sanitize_value(v, redact=redact, _depth=_depth + 1)
+            for k, v in value.items()
+        }
+    return value
+
+
 def sanitize_messages(
     messages: list[dict] | None, *, redact: bool = False
 ) -> list[dict] | None:
@@ -278,7 +296,7 @@ def sanitize_messages(
         if isinstance(content, str):
             item["content"] = sanitize_text(content, redact=redact)
         elif content is not None:
-            item["content"] = strip_image_payloads(content)
+            item["content"] = _sanitize_value(strip_image_payloads(content), redact=redact)
         if item.get("tool_calls") and isinstance(item["tool_calls"], list):
             calls = []
             for call in item["tool_calls"]:
@@ -290,7 +308,9 @@ def sanitize_messages(
                     if isinstance(args, str):
                         fn_copy["arguments"] = sanitize_text(args, redact=redact)
                     elif args is not None:
-                        fn_copy["arguments"] = strip_image_payloads(args)
+                        fn_copy["arguments"] = _sanitize_value(
+                            strip_image_payloads(args), redact=redact
+                        )
                     c["function"] = fn_copy
                 calls.append(c)
             item["tool_calls"] = calls

@@ -190,7 +190,7 @@ memhub connect git git@github.com:<你的用户名>/my-vibecoding-memory.git
   redact_secrets: true   # 或环境变量 MEMHUB_REDACT_SECRETS=true
   ```
 
-  打开后，OpenAI / Anthropic / GitHub / AWS / Slack / JWT / URL 密码等 20+ 种高置信度凭证会在落盘前替换为 `<redacted type='...'/>`。**这时「记住我的 key」也会被替换成占位符**，两者不可兼得。
+  打开后，OpenAI / Anthropic / GitHub / AWS / Slack / JWT / URL 密码等 20+ 种高置信度凭证会在落盘前替换为 `<redacted type='...'/>`。只识别有固定格式的凭证：`password=hunter2`、`Authorization: Bearer ...`、`export FOO_TOKEN=...` 这种值本身没有特征的写法**不会**被替换，这类内容请用 `<private>` 包起来。**这时「记住我的 key」也会被替换成占位符**，两者不可兼得。
 
 - **内联 Base64 图片**（浏览器截图等）无论开关如何都会被替换为 `<elided N chars>`，只影响体积，不影响语义。
 

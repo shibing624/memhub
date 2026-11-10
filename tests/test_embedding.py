@@ -156,7 +156,8 @@ def test_default_embed_budget_fits_dense_text_under_the_token_limit():
 
     Character-only truncation used to send more tokens than the configured limit.
     """
-    tiktoken = pytest.importorskip("tiktoken", reason="requires tiktoken tokenizer")
+    import tiktoken
+
     encoding = tiktoken.get_encoding("cl100k_base")
     svc = EmbedService(
         base_url="https://api.test/v1",

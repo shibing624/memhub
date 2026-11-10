@@ -62,6 +62,7 @@ class MemoryWriter:
         memory_at: int | None = None,
         messages: list[ChatMessage] | None = None,
         workspace_id: str | None = None,
+        workspace_remote: str | None = None,
     ) -> WriterOutcome:
         scope = (app_id, user_id, agent_id)
         key = "request:" + json.dumps([scope, request_id])
@@ -93,6 +94,7 @@ class MemoryWriter:
                     memory_at=memory_at,
                     node_id=raw_id,
                     workspace_id=workspace_id,
+                    workspace_remote=workspace_remote,
                 )
             # Failed model work leaves original evidence available for retry; a
             # committed plan is recovered from the plan journal by run_system1.
@@ -119,6 +121,7 @@ class MemoryWriter:
         memory_at: int | None,
         node_id: str | None = None,
         workspace_id: str | None = None,
+        workspace_remote: str | None = None,
     ) -> MemoryNode:
         raw = MemoryNode(
             content=content,
@@ -131,7 +134,17 @@ class MemoryWriter:
             memory_at=memory_at,
             # The project the dialogue happened in travels with the evidence, so
             # every device that receives it can scope recall to that project.
-            custom={"workspace_id": workspace_id} if workspace_id else None,
+            # ``workspace_remote`` (the origin ``org/repo``) tells two checkouts
+            # apart on a device where this path does not exist.
+            custom={
+                k: v
+                for k, v in (
+                    ("workspace_id", workspace_id),
+                    ("workspace_remote", workspace_remote),
+                )
+                if v
+            }
+            or None,
         )
         if node_id:
             raw.node_id = node_id
@@ -157,6 +170,7 @@ class MemoryWriter:
         request_id: str,
         memory_at: int | None = None,
         workspace_id: str | None = None,
+        workspace_remote: str | None = None,
     ) -> WriterOutcome:
         """Store L0 evidence under ``request_id`` without extraction.
 
@@ -190,6 +204,7 @@ class MemoryWriter:
                     memory_at=memory_at,
                     node_id=raw_id,
                     workspace_id=workspace_id,
+                    workspace_remote=workspace_remote,
                 )
             elif (
                 raw.content != content

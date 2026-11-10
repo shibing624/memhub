@@ -857,14 +857,28 @@ def detect_installed_hosts(
     ]
 
 
-def hosts_status(*, home: Path | None = None) -> dict[str, dict[str, bool | None]]:
+def hosts_status(*, home: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Per host: skill / mcp / hooks installed (``None`` = the host has no such
+    entry). A host whose own config file cannot be parsed (a user's hand edit left
+    a trailing comma) reports it as ``error`` instead of failing every other host."""
     home = home or Path.home()
-    out: dict[str, dict[str, bool | None]] = {}
+    out: dict[str, dict[str, Any]] = {}
     for host, spec in HOSTS.items():
         _, skill = _paths(host, home)
-        out[host] = {
-            "skill": skill.is_file() and SKILL_MARKER in skill.read_text(encoding="utf-8"),
-            "mcp": spec.mcp[0].installed(home / spec.mcp[1]) if spec.mcp else None,
-            "hooks": spec.hooks[0].installed(home / spec.hooks[1]) if spec.hooks else None,
-        }
+        try:
+            out[host] = {
+                "skill": skill.is_file()
+                and SKILL_MARKER in skill.read_text(encoding="utf-8"),
+                "mcp": spec.mcp[0].installed(home / spec.mcp[1]) if spec.mcp else None,
+                "hooks": (
+                    spec.hooks[0].installed(home / spec.hooks[1]) if spec.hooks else None
+                ),
+            }
+        except Exception as exc:  # JSON / TOML / YAML errors of a third-party file
+            out[host] = {
+                "skill": False,
+                "mcp": False,
+                "hooks": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
     return out

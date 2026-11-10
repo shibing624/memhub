@@ -174,6 +174,7 @@ def workspace_keys(workspace: str) -> set[str]:
 
 def _workspaces_match(
     found: str,
+    found_remote: str,
     target: str,
     keys_cache: dict[str, set[str]],
     git_cache: dict[str, tuple[bool, bool, str]],
@@ -182,15 +183,22 @@ def _workspaces_match(
         keys_cache[found] = workspace_keys(found)
     if target not in keys_cache:
         keys_cache[target] = workspace_keys(target)
-    if keys_cache[found] & keys_cache[target]:
+    found_keys = keys_cache[found] | (
+        {f"remote:{found_remote.lower()}"} if found_remote else set()
+    )
+    if found_keys & keys_cache[target]:
         return True
 
     # Cross-machine fallback: a session synced from another machine stores a
     # checkout path that does not exist here, so its canonical root can never be
-    # compared. Match it to a local git repo of the same folder name instead.
-    # Two clones that both declare a remote are deliberately NOT folded this way:
-    # a fork named like the upstream repo is a different project, and merging them
-    # would leak one project's memory into the other's recall.
+    # compared, and its remote is known only when the write recorded it
+    # (``workspace_remote``). Without one, match a local git repo of the same
+    # folder name. With remotes on both sides that differ, the projects differ: a
+    # fork named like the upstream repo must not receive the upstream's memory.
+    found_named = any(k.startswith("remote:") for k in found_keys)
+    target_named = any(k.startswith("remote:") for k in keys_cache[target])
+    if found_named and target_named:
+        return False
     for w in (found, target):
         if w not in git_cache:
             expanded = Path(w).expanduser()
@@ -200,13 +208,9 @@ def _workspaces_match(
             git_cache[w] = (exists, info is not None, leaf)
     f_exists, f_is_git, f_leaf = git_cache[found]
     t_exists, t_is_git, t_leaf = git_cache[target]
-    if f_leaf and f_leaf == t_leaf:
-        both_named = any(k.startswith("remote:") for k in keys_cache[found]) and any(
-            k.startswith("remote:") for k in keys_cache[target]
-        )
-        if not both_named and ((t_is_git and not f_exists) or (f_is_git and not t_exists)):
-            return True
-    return False
+    return bool(f_leaf) and f_leaf == t_leaf and (
+        (t_is_git and not f_exists) or (f_is_git and not t_exists)
+    )
 
 
 def node_workspace(node: MemoryNode) -> str:
@@ -246,7 +250,8 @@ def workspace_sessions(nodes: list[MemoryNode], workspace: str) -> list[str]:
         found = node_workspace(node)
         if not found or not node.session_id:
             continue
-        if _workspaces_match(found, workspace, keys_cache, git_cache):
+        remote = str((node.custom or {}).get("workspace_remote") or "")
+        if _workspaces_match(found, remote, workspace, keys_cache, git_cache):
             sessions.add(node.session_id)
     return sorted(sessions)
 

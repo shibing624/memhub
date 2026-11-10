@@ -27,7 +27,12 @@ from memhub.client import MemoryClient
 from memhub.coding.types import PROCEDURE_KIND
 from memhub.config import Settings
 from memhub.errors import IdempotencyConflictError
-from memhub.hub.browse import browse_rows, canonical_workspace, workspace_sessions
+from memhub.hub.browse import (
+    browse_rows,
+    canonical_workspace,
+    git_remote_slug,
+    workspace_sessions,
+)
 from memhub.hub.config import (
     SyncConfig,
     format_time,
@@ -38,7 +43,7 @@ from memhub.hub.config import (
     publish_runtime,
     unpublish_runtime,
 )
-from memhub.hub.queue import HubWriteQueue
+from memhub.hub.queue import HubWriteQueue, evidence_fingerprint
 from memhub.hub.redact import sanitize_messages, sanitize_text
 from memhub.hub.sync import HubSyncer, SyncBackend, project_received
 from memhub.sdk_models import SearchMemories
@@ -271,15 +276,19 @@ def create_hub_app(
                 }
                 # Rows queued before boundaries existed carry none.
                 workspace_id = payload.get("workspace_id")
+                workspace_remote = payload.get("workspace_remote")
                 if payload["raw_only"]:
                     result = await core_client.add_raw(
-                        **kwargs, workspace_id=workspace_id
+                        **kwargs,
+                        workspace_id=workspace_id,
+                        workspace_remote=workspace_remote,
                     )
                 else:
                     result = await core_client.add(
                         **kwargs,
                         workspace_id=workspace_id,
                         branch=payload.get("branch"),
+                        workspace_remote=workspace_remote,
                     )
                 if syncer is not None:
                     syncer.kick()
@@ -376,11 +385,23 @@ def create_hub_app(
                 detail="content and messages cannot both be empty",
             )
         payload = body.model_dump(exclude={"wait"})
+        # Identity of the evidence as the client sent it, so a resend matches the
+        # stored row whatever this Core's sanitizing settings are now.
+        fingerprint = evidence_fingerprint(payload)
         redact = app.state.client.settings.redact_secrets
-        payload["content"] = sanitize_text(payload["content"], redact=redact)
-        payload["messages"] = sanitize_messages(payload["messages"], redact=redact)
-        if payload.get("workspace_id"):
-            payload["workspace_id"] = canonical_workspace(payload["workspace_id"]) or None
+
+        def prepare() -> None:
+            # Regex sanitizing of a large batch and the workspace's walk up to
+            # ``.git`` are blocking work; keep them off the Core's event loop.
+            payload["content"] = sanitize_text(payload["content"], redact=redact)
+            payload["messages"] = sanitize_messages(payload["messages"], redact=redact)
+            if payload.get("workspace_id"):
+                payload["workspace_remote"] = git_remote_slug(payload["workspace_id"])
+                payload["workspace_id"] = (
+                    canonical_workspace(payload["workspace_id"]) or None
+                )
+
+        await asyncio.to_thread(prepare)
         if not payload["content"].strip() and not payload["messages"]:
             return {
                 "request_id": body.request_id,
@@ -390,12 +411,7 @@ def create_hub_app(
                 "result": {"skipped": "private"},
                 "error": None,
             }
-        # An absent boundary stays absent, so receipts written before boundaries
-        # existed keep their fingerprint when the same batch is resubmitted.
-        for key in ("workspace_id", "branch"):
-            if payload[key] is None:
-                del payload[key]
-        job = app.state.queue.submit(payload)
+        job = app.state.queue.submit(payload, fingerprint=fingerprint)
         if body.wait:
             job = await app.state.queue.wait(body.request_id)
         return job
@@ -445,8 +461,8 @@ def create_hub_app(
         core_client: MemoryClient = app.state.client
         vector = core_client.factory.vector
 
-        # A full id is one record read. Only a short prefix needs the L0 scan, and
-        # that scan is bounded by the L0 layer filter rather than the whole store.
+        # A full id is one record read. A short prefix is matched against the L0
+        # ids alone; only the matching records are then read.
         anchor = await asyncio.to_thread(vector.get, needle)
         if anchor is not None and (
             anchor.layer != Layer.L0_RAW
@@ -455,8 +471,8 @@ def create_hub_app(
         ):
             anchor = None
         if anchor is None:
-            nodes = await asyncio.to_thread(
-                vector.get_many,
+            ids = await asyncio.to_thread(
+                vector.get_ids,
                 build_filter(
                     app_ids=[core_client.settings.default_app_id],
                     user_id=HUB_USER_ID,
@@ -464,13 +480,11 @@ def create_hub_app(
                     statuses=[MemoryStatus.ACTIVE],
                     layers=[Layer.L0_RAW],
                 ),
-                None,
             )
-            matches = [
-                node
-                for node in nodes
-                if len(needle) >= 6 and node.node_id.startswith(needle)
-            ]
+            hits = [i for i in ids if len(needle) >= 6 and i.startswith(needle)]
+            matches = list(
+                (await asyncio.to_thread(vector.get_by_ids, hits)).values()
+            )
             if not matches:
                 raise HTTPException(
                     status_code=404, detail=f"L0 conversation {needle!r} not found"
@@ -505,24 +519,33 @@ def create_hub_app(
             selected = selected[max(0, idx - span) : idx + span + 1]
         else:
             selected = [anchor]
+
+        def rows() -> list[dict[str, Any]]:
+            # canonical_workspace walks the filesystem; one walk per workspace.
+            canon: dict[str, str] = {}
+            out = []
+            for n in selected:
+                raw_ws = str((n.custom or {}).get("workspace_id") or "")
+                if raw_ws not in canon:
+                    canon[raw_ws] = canonical_workspace(raw_ws)
+                out.append(
+                    {
+                        "memory_id": n.node_id,
+                        "source_id": n.node_id[:8],
+                        "session_id": n.session_id,
+                        "content": n.content,
+                        "memory_at": n.memory_at or n.gmt_created,
+                        "workspace_id": canon[raw_ws],
+                        "is_anchor": n.node_id == anchor.node_id,
+                    }
+                )
+            return out
+
         return {
             "source_id": anchor.node_id[:8],
             "memory_id": anchor.node_id,
             "session_id": anchor.session_id,
-            "conversations": [
-                {
-                    "memory_id": n.node_id,
-                    "source_id": n.node_id[:8],
-                    "session_id": n.session_id,
-                    "content": n.content,
-                    "memory_at": n.memory_at or n.gmt_created,
-                    "workspace_id": canonical_workspace(
-                        str((n.custom or {}).get("workspace_id") or "")
-                    ),
-                    "is_anchor": n.node_id == anchor.node_id,
-                }
-                for n in selected
-            ],
+            "conversations": await asyncio.to_thread(rows),
         }
 
     @app.post("/v1/hub/recall", dependencies=[Depends(verify)])
@@ -640,7 +663,14 @@ def create_hub_app(
     @app.put("/v1/hub/memories/{memory_id}", dependencies=[Depends(verify)])
     async def edit_memory(memory_id: str, body: HubMemoryEdit):
         """A user correction: a new current version; the old one stays as history."""
-        return changed(await app.state.client.update(memory_id, body.content))
+        content = sanitize_text(
+            body.content, redact=app.state.client.settings.redact_secrets
+        )
+        if not content.strip():
+            raise HTTPException(
+                status_code=400, detail="content is empty after removing <private>"
+            )
+        return changed(await app.state.client.update(memory_id, content))
 
     @app.delete("/v1/hub/memories/{memory_id}", dependencies=[Depends(verify)])
     async def delete_memory(memory_id: str):

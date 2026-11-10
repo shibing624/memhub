@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **修复 Hub 采集与写入边界的若干静默故障**：
+  - 一个半写或格式异常的会话文件（如 Cline 正在重写的 `*.messages.json`）不再中止整轮 `memhub scan`：该文件跳过并计入 `errors`，游标不动，下次扫描重读；其余文件照常入库。Core 不可达仍会中止。
+  - Hub 写入的幂等指纹只覆盖证据本身（`content` / `messages` / `session_id`），且按客户端提交的原文计算：重投时 `memory_at`（文件 mtime）、workspace 归一化结果或 `redact_secrets` 开关变化，不再触发永久 409。`hub.db` 旧行在启动时一次性迁移。
+  - L0 写入时同时记录 `custom["workspace_remote"]`（origin `org/repo`）；跨机器按项目召回时两边 remote 不同即视为不同项目，同名目录的私有仓库不再串入。未记录 remote 的旧数据仍按目录名兜底。
+  - `conversation_search(source_id=...)` 的短 ID 展开只读取 L0 的 id，再按命中 id 取原文，不再把全部 L0 原文读进内存；写入与展开路径上的正则清洗和 `.git` 探测移出事件循环。
+  - `memhub doctor` 遇到损坏的 `hub.json` 或宿主配置文件（如手改 `~/.cursor/mcp.json` 多了逗号）时报告为检查项，不再直接崩溃。
+  - `PUT /v1/hub/memories/{id}`（`memory_update`）同样剥离 `<private>` 并按开关脱敏；block 形状的 content 与 dict 形状的工具参数也会被清洗；PEM 私钥正则在大量未闭合头部下保持线性。
+  - Trae 等内联采集的宿主：写入 Core 成功后才删除暂存的提问，Core 不可达时这一轮不再丢失。
 - **修复长对话写入 embedding 超上游 token 上限**：原先只按 `embed_max_tokens × embed_chars_per_token` 截字符，中文、emoji 和代码混排时字符/token 比会低于估算值，截后的输入仍可能超过上游限制并被拒绝。现在额外按 UTF-8 字节数封顶（`≤ embed_max_tokens` 字节），字节级 BPE 下每个 token 至少覆盖一字节，因此截断输入不会超 `embed_max_tokens`；完整原文仍保留在 L0_RAW 并用于抽取。
 - **项目标识归一化（Git Worktree / 子模块 / 子目录 / 跨机器 Remote 对齐）**：
   - `memhub.hub.browse` 新增 `canonical_workspace`、`resolve_workspace_root`、`git_remote_slug` 与 `parse_origin_slug`：无需派生 `git` 子进程即可直接解析 `.git` 目录或文件（支持 linked `git worktree`、`git submodule`、bare worktree），将任意子目录或 worktree 路径自动归并到主仓库根目录。
@@ -15,7 +23,7 @@
 - **`<private>` 隐私标签剥离与多模态 Base64 图片载荷清洗**：
   - 新增 `memhub.hub.redact`：支持 `<private>...</private>` 隐私块剥离（只去掉标签内的内容，同一轮里标签外的提问与 assistant 的回答照常入库；未闭合的 `<private>` 丢弃其后全部内容）。`<private>` 是用户主动声明的排除范围，与「让 Agent 记住某个 key」不冲突。
   - 自动清洗对话与工具参数中的内联 `data:image/...;base64,...` 大图及 Anthropic / Claude Read / MCP / OpenAI 多模态图片块（替换为 `<elided ...>`），防止浏览器截图等大块 Base64 撑爆 SQLite 与同步日志。
-  - **自动 Secret 脱敏默认关闭**（`redact_secrets: false`，对应 `MEMHUB_REDACT_SECRETS`）：这是个人助理场景，用户说「记住我的 key 是 X」就该记住。设为 `true` 后，内置 20+ 种高置信度凭证正则（URL 密码、AWS Access/Secret Key、GitHub PAT、OpenAI `sk-`、Anthropic `sk-ant-`、Slack/Discord Token & Webhook、JWT、PEM 私钥、Google/GitLab/HF/npm/PyPI/Groq/xAI/Perplexity Key 等）会在落盘与同步前统一替换为 `<redacted type='...'/>`，适合担心工具片段里的密钥被长期保存的用户。此前实现无开关、恒定开启，导致「记住 key」只能存下一个占位符。
+  - **自动 Secret 脱敏默认关闭**（`redact_secrets: false`，对应 `MEMHUB_REDACT_SECRETS`）：这是个人助理场景，用户说「记住我的 key 是 X」就该记住。设为 `true` 后，内置 20+ 种高置信度凭证正则（URL 密码、AWS Access/Secret Key、GitHub PAT、OpenAI `sk-`、Anthropic `sk-ant-`、Slack/Discord Token & Webhook、JWT、PEM 私钥、Google/GitLab/HF/npm/PyPI/Groq/xAI/Perplexity Key 等）会在落盘与同步前统一替换为 `<redacted type='...'/>`，只识别有固定格式的凭证；`password=xxx`、`Authorization: Bearer xxx`、`export FOO_TOKEN=xxx` 这类无固定格式的值不会被替换，敏感内容请用 `<private>` 主动排除。
 - **新增 `memhub doctor` 诊断命令与后台故障显式告警注入**：
   - 新增 `memhub doctor`（支持 `--json`）：只读检查 `~/.memhub/config.yaml` 三把密钥、本机 Core 存活状态、`hub.db` 写入队列健康度、跨设备同步状态以及本机已探测宿主的接入完整性，并给出修复命令。
   - 当后台存在重试耗尽的 `failed` 写入任务或跨设备同步报错时，`/v1/hub/recall` 与 `memhub hook` 会在 `<relevant-memories>` 末尾自动追加醒目告警，让 Agent 在首句回复提醒用户运行 `memhub doctor` 或 `memhub retry`，避免后台静默失败。

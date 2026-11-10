@@ -35,6 +35,22 @@ IdleHook = Callable[[], Awaitable[Any]]
 _JOB_COLUMNS = "request_id,status,raw_only,attempts,result,error,created_at,updated_at"
 
 
+def evidence_fingerprint(payload: dict[str, Any]) -> str:
+    """Identity of a write's evidence: what was said, in which session.
+
+    ``memory_at`` and the workspace boundary describe the evidence rather than
+    being it: a transcript reread later can stamp another time (a file mtime) or
+    resolve the workspace differently (``git init`` since), and the same request
+    must still be recognised as the one already stored.
+    """
+    encoded = json.dumps(
+        [payload.get("content", ""), payload.get("messages"), payload.get("session_id", "")],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
 class HubWriteQueue:
     """Persist source evidence before one worker serially calls MemoryClient."""
 
@@ -67,6 +83,19 @@ class HubWriteQueue:
         self._conn.execute(
             "UPDATE hub_writes SET status='pending' WHERE status='running'"
         )
+        if self._conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+            # Rows stored before the fingerprint covered only the evidence.
+            rows = self._conn.execute(
+                "SELECT request_id,payload FROM hub_writes"
+            ).fetchall()
+            self._conn.executemany(
+                "UPDATE hub_writes SET fingerprint=? WHERE request_id=?",
+                [
+                    (evidence_fingerprint(json.loads(r["payload"])), r["request_id"])
+                    for r in rows
+                ],
+            )
+            self._conn.execute("PRAGMA user_version=1")
         self._conn.commit()
         self._process = process
         self._max_attempts = max_attempts
@@ -91,13 +120,21 @@ class HubWriteQueue:
             self._dirty = True
             self._wake.set()
 
-    def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Store a write once; resubmitting requeues a failed row or upgrades raw to full."""
+    def submit(
+        self, payload: dict[str, Any], *, fingerprint: str | None = None
+    ) -> dict[str, Any]:
+        """Store a write once; resubmitting requeues a failed row or upgrades raw to full.
+
+        ``fingerprint`` defaults to ``evidence_fingerprint(payload)``; the Core passes
+        the one of the evidence as submitted, before sanitizing, so changing
+        ``redact_secrets`` does not turn a resend into a conflict. A resend keeps the
+        stored payload.
+        """
         request_id = str(payload["request_id"])
         raw_only = bool(payload["raw_only"])
         evidence = {k: v for k, v in payload.items() if k != "raw_only"}
         encoded = json.dumps(evidence, ensure_ascii=False, sort_keys=True)
-        fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
+        fingerprint = fingerprint or evidence_fingerprint(payload)
         now = int(time.time())
         row = self._conn.execute(
             "SELECT fingerprint,status,raw_only FROM hub_writes WHERE request_id=?",

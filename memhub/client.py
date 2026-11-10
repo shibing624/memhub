@@ -248,6 +248,7 @@ class MemoryClient:
         request_id: str | None = None,
         workspace_id: str | None = None,
         branch: str | None = None,
+        workspace_remote: str | None = None,
     ) -> WriteResult:
         """Write one memory and run the cognition pipeline (Extract -> commit -> ...).
 
@@ -339,6 +340,7 @@ class MemoryClient:
             "request_id": request_id,
             "memory_at": memory_at,
             "workspace_id": workspace_id,
+            "workspace_remote": workspace_remote,
         }
         async with self._user_write_lock_ctx(resolved_app_id, user_id):
             result = await self.writer.write(**write_kwargs, messages=normalized)
@@ -390,6 +392,7 @@ class MemoryClient:
         memory_at: int | None = None,
         request_id: str | None = None,
         workspace_id: str | None = None,
+        workspace_remote: str | None = None,
     ) -> WriteResult:
         """Write L0_RAW only (embed + store). Does not run extract.
 
@@ -424,6 +427,7 @@ class MemoryClient:
                 memory_at=memory_at,
                 request_id=request_id,
                 workspace_id=workspace_id,
+                workspace_remote=workspace_remote,
             )
         return WriteResult(
             success=True,

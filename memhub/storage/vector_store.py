@@ -163,6 +163,9 @@ class VectorStore(ABC):
     def get_many(self, where: dict, limit: int | None = 1000) -> list[MemoryNode]: ...
 
     @abstractmethod
+    def get_ids(self, where: dict) -> list[str]: ...
+
+    @abstractmethod
     def update_payload(self, node_id: str, patch: dict) -> None: ...
 
     @abstractmethod
@@ -1088,6 +1091,13 @@ class ChromaVectorStore(VectorStore):
             MemoryNode.from_storage(content, meta)
             for content, meta in zip(result["documents"], result["metadatas"])
         ]
+
+    def get_ids(self, where: dict) -> list[str]:
+        """Ids of the nodes matching a metadata filter; no documents or metadata read."""
+        with self._guard():
+            return list(
+                self.collection.get(where=_normalize_where(where), include=[])["ids"]
+            )
 
     def update_payload(self, node_id: str, patch: dict) -> None:
         """Merge a metadata patch into an existing node; no-op if it does not exist."""

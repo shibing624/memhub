@@ -47,6 +47,8 @@ agentica = [
 # Without this extra those tests can only fail (or silently skip) on a clean checkout.
 test = [
     "agentica",
+    # Pins the embedding byte cap against a real tokenizer (tests/test_embedding.py).
+    "tiktoken",
 ]
 # All optional frontends
 all = [
