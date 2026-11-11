@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from memhub.coding.judge import evaluate_decisions
+from memhub.coding.preproc import fit_dialogue
 from memhub.coding.types import (
     CodingDecisionError,
     CodingMemory,
@@ -45,10 +46,20 @@ _WITHOUT_TARGET = (
 _NEEDS_TARGET = set(_WITH_TARGET) - {"ADD_SUPPLEMENT", "INVALID", "NEED_CONTEXT"}
 # Room the questions and the envelope take next to the state.
 _QUESTION_OVERHEAD = 4_000
+_OPTION_CHARS = 240
 
 
-def _size(state: dict) -> int:
-    return len(json.dumps(state, ensure_ascii=False, default=str)) + _QUESTION_OVERHEAD
+def _size(state: dict, overhead: int = _QUESTION_OVERHEAD) -> int:
+    return len(json.dumps(state, ensure_ascii=False, default=str)) + overhead
+
+
+def _max_question_chars(questions: dict[str, dict[str, Any]]) -> int:
+    if not questions:
+        return _QUESTION_OVERHEAD
+    largest = max(
+        len(json.dumps({k: q}, ensure_ascii=False)) for k, q in questions.items()
+    )
+    return max(_QUESTION_OVERHEAD, largest + 1_000)
 
 
 def _action_question(draft_idx: int, *, has_target: bool) -> dict:
@@ -88,14 +99,6 @@ class CodingMemoryReconciler:
         self.jev = jev
         self.candidate_limit = candidate_limit
 
-    @staticmethod
-    def _fit(state: dict[str, Any], max_state_chars: int) -> dict[str, Any]:
-        """``state`` with the oldest current heads dropped until it fits the budget."""
-        current = list(state["current"])
-        while current and _size(dict(state, current=current)) > max_state_chars:
-            current.pop()
-        return dict(state, current=current)
-
     async def reconcile(
         self,
         drafts: list[CodingMemoryDraft],
@@ -128,6 +131,12 @@ class CodingMemoryReconciler:
             return []
         proposals = [dict(d.to_dict(), id=i) for i, d in enumerate(drafts)]
         if _size({"source": source_messages, "drafts": proposals}) > max_state_chars:
+            drafts_chars = _size({"source": [], "drafts": proposals})
+            if drafts_chars <= max_state_chars:
+                source_messages = fit_dialogue(
+                    source_messages, max(max_state_chars - drafts_chars, 0)
+                )
+        if _size({"source": source_messages, "drafts": proposals}) > max_state_chars:
             raise CodingDecisionError(
                 "coding source and drafts exceed the Jev context budget"
             )
@@ -136,15 +145,45 @@ class CodingMemoryReconciler:
         boundaries = {version_boundary(d) for d in drafts}
         current = [m for m in current if version_boundary(by_id[m["memory_id"]]) in boundaries]
         if len(current) > self.candidate_limit:
-            selected = []
-            for start in range(0, len(current), self.candidate_limit):
-                page = current[start : start + self.candidate_limit]
+            selected: list[tuple[float, int, str]] = []
+            cursor = 0
+            while cursor < len(current):
+                page = list(current[cursor : cursor + self.candidate_limit])
+                while (
+                    len(page) > 1
+                    and _size(
+                        {"source": source_messages, "drafts": proposals, "current": page}
+                    )
+                    > max_state_chars
+                ):
+                    page.pop()
+                if (
+                    _size(
+                        {"source": source_messages, "drafts": proposals, "current": page}
+                    )
+                    > max_state_chars
+                ):
+                    slim = dict(page[0], history_versions=[])
+                    if (
+                        _size(
+                            {
+                                "source": source_messages,
+                                "drafts": proposals,
+                                "current": [slim],
+                            }
+                        )
+                        > max_state_chars
+                    ):
+                        cursor += 1
+                        continue
+                    page = [slim]
                 answers = await evaluate_decisions(
                     self.jev,
-                    state=self._fit(
-                        {"source": source_messages, "drafts": proposals, "current": page},
-                        max_state_chars,
-                    ),
+                    state={
+                        "source": source_messages,
+                        "drafts": proposals,
+                        "current": page,
+                    },
                     questions={
                         m["memory_id"]: {
                             "type": "choice",
@@ -161,55 +200,69 @@ class CodingMemoryReconciler:
                         for m in page
                     },
                 )
-                selected.extend(
-                    m for m in page if answers[m["memory_id"]].choice == "INCLUDE"
-                )
-            if len(selected) > self.candidate_limit:
-                raise CodingDecisionError(
-                    "coding selected material exceeds candidate budget"
-                )
-            current = selected
+                for offset, m in enumerate(page):
+                    ans = answers[m["memory_id"]]
+                    if ans.choice == "INCLUDE":
+                        selected.append(
+                            (
+                                float(ans.confidence or 0.0),
+                                -(cursor + offset),
+                                m["memory_id"],
+                            )
+                        )
+                cursor += len(page)
+            ranked_ids = [
+                mid
+                for _, _, mid in sorted(selected, reverse=True)[: self.candidate_limit]
+            ]
+            by_selected = {m["memory_id"]: m for m in current}
+            current = [by_selected[mid] for mid in ranked_ids if mid in by_selected]
 
-        # Heads are newest first; the oldest are dropped until the state fits.
-        state = self._fit(
-            {"source": source_messages, "drafts": proposals, "current": current},
-            max_state_chars,
-        )
-        current = state["current"]
-        # No coverage gate (as in the chat path): a rejected extraction would discard
-        # every candidate of the write; extraction runs once and the source is kept.
-        questions: dict[str, dict[str, Any]] = {}
-        # A relation can only link heads in the draft's own version boundary
-        # (structured metadata), so other boundaries are never offered as targets.
-        heads = {
-            i: {
-                m["memory_id"]: m["task"]
-                for m in current
-                if version_boundary(by_id[m["memory_id"]]) == version_boundary(draft)
-            }
-            for i, draft in enumerate(drafts)
-        }
-        for i in range(len(drafts)):
-            if heads[i]:
-                questions[f"{i}:target"] = {
-                    "type": "choice",
-                    "instructions": (
-                        f"Select the one CURRENT head for a relation to draft {i}, "
-                        "or NONE when the draft is an independent solution, a limited "
-                        "exception, has no durable value, or has independent "
-                        "environment constraints. Never select an ancestor or another "
-                        "incoming draft. "
-                        "Choose MULTIPLE only when the candidates need per-head "
-                        "adjudication; expansion must resolve to exactly one head."
-                    ),
-                    "criteria": {
-                        **heads[i],
-                        "NONE": "No current head",
-                        "MULTIPLE": "Needs per-head adjudication",
-                    },
+        def build_target_questions(
+            items: list[dict[str, Any]],
+        ) -> tuple[dict[int, dict[str, str]], dict[str, dict[str, Any]]]:
+            # A relation can only link heads in the draft's own version boundary
+            # (structured metadata), so other boundaries are never offered as targets.
+            per_draft = {
+                i: {
+                    m["memory_id"]: m["task"][:_OPTION_CHARS]
+                    for m in items
+                    if version_boundary(by_id[m["memory_id"]]) == version_boundary(draft)
                 }
-            else:
-                questions[f"{i}:action"] = _action_question(i, has_target=False)
+                for i, draft in enumerate(drafts)
+            }
+            qs: dict[str, dict[str, Any]] = {}
+            for i in range(len(drafts)):
+                if per_draft[i]:
+                    qs[f"{i}:target"] = {
+                        "type": "choice",
+                        "instructions": (
+                            f"Select the one CURRENT head for a relation to draft {i}, "
+                            "or NONE when the draft is an independent solution, a limited "
+                            "exception, has no durable value, or has independent "
+                            "environment constraints. Never select an ancestor or another "
+                            "incoming draft. "
+                            "Choose MULTIPLE only when the candidates need per-head "
+                            "adjudication; expansion must resolve to exactly one head."
+                        ),
+                        "criteria": {
+                            **per_draft[i],
+                            "NONE": "No current head",
+                            "MULTIPLE": "Needs per-head adjudication",
+                        },
+                    }
+                else:
+                    qs[f"{i}:action"] = _action_question(i, has_target=False)
+            return per_draft, qs
+
+        # Heads are newest first; the oldest are dropped until state + largest question fits.
+        current = list(current)
+        heads, questions = build_target_questions(current)
+        state = {"source": source_messages, "drafts": proposals, "current": current}
+        while current and _size(state, _max_question_chars(questions)) > max_state_chars:
+            current.pop()
+            heads, questions = build_target_questions(current)
+            state = {"source": source_messages, "drafts": proposals, "current": current}
         answers = await evaluate_decisions(self.jev, state=state, questions=questions)
         chosen: dict[int, str | None] = {}
         for i in range(len(drafts)):
@@ -235,18 +288,19 @@ class CodingMemoryReconciler:
                 picked = await evaluate_decisions(
                     self.jev, state=state, questions=include
                 )
+                # Without MERGE, one procedure cannot retire multiple heads; an
+                # uncertain, zero-match or multi-head expansion keeps existing heads
+                # current and decides the draft as an independent version.
                 if any(item.choice == "UNSURE" for item in picked.values()):
-                    raise CodingDecisionError("uncertain coding targets")
+                    chosen[i] = None
+                    continue
                 matched = [
                     nid
                     for nid in heads[i]
                     if picked[f"{i}:{nid}"].choice == "INCLUDE"
                 ]
-                if len(matched) != 1:
-                    raise CodingDecisionError(
-                        "coding relation requires exactly one current head"
-                    )
-                target = matched[0]
+                chosen[i] = matched[0] if len(matched) == 1 else None
+                continue
             chosen[i] = None if target == "NONE" else target
         action_questions = {
             f"{i}:action": _action_question(i, has_target=chosen[i] is not None)

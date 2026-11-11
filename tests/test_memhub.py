@@ -3503,3 +3503,75 @@ async def test_doctor_command_and_hook_health_warning_on_failed_writes(
         assert "memhub install-host" in by_name["Detected hosts"]["detail"]
     await core.aclose()
 
+
+async def test_failed_writes_auto_recover_on_later_success_and_restart_without_poison_loop(
+    tmp_path: Path,
+) -> None:
+    state = {"outage": True, "poison": True}
+    calls: dict[str, int] = {}
+
+    async def processor(payload: dict) -> dict:
+        rid = payload["request_id"]
+        calls[rid] = calls.get(rid, 0) + 1
+        if state["outage"]:
+            raise RuntimeError("502 Bad Gateway")
+        if rid == "r-poison" and state["poison"]:
+            raise RuntimeError("deterministic bad payload")
+        return {"ok": rid}
+
+    db_path = tmp_path / "hub.db"
+    queue = HubWriteQueue(db_path, processor, max_attempts=2, retry_base_seconds=0.01)
+    queue.start()
+
+    def submit(rid: str) -> dict:
+        return queue.submit(
+            {
+                "content": rid,
+                "messages": None,
+                "session_id": "s",
+                "memory_at": 100,
+                "request_id": rid,
+                "raw_only": False,
+            }
+        )
+
+    submit("r-transient")
+    submit("r-poison")
+    assert (await queue.wait("r-transient"))["status"] == "failed"
+    assert (await queue.wait("r-poison"))["status"] == "failed"
+
+    # Outage ends and a new turn succeeds: r-transient auto-heals without manual
+    # `memhub retry`; r-poison gets 1 probe, fails (attempts=3), and stops looping.
+    state["outage"] = False
+    submit("r-healthy-1")
+    assert (await queue.wait("r-healthy-1"))["status"] == "done"
+    for _ in range(200):
+        if (
+            queue.get("r-transient")["status"] == "done"
+            and queue.get("r-poison")["status"] == "failed"
+            and queue.get("r-poison")["attempts"] == 3
+        ):
+            break
+        await asyncio.sleep(0.01)
+    assert queue.get("r-transient")["status"] == "done"
+    assert (queue.get("r-poison")["status"], queue.get("r-poison")["attempts"]) == (
+        "failed",
+        3,
+    )
+
+    # Another healthy write does NOT re-trigger r-poison (no infinite loop).
+    submit("r-healthy-2")
+    assert (await queue.wait("r-healthy-2"))["status"] == "done"
+    await asyncio.sleep(0.05)
+    assert calls["r-poison"] == 3
+    await queue.close()
+
+    # Restarting the Core after a code/config fix automatically drains prior failures.
+    state["poison"] = False
+    restarted = HubWriteQueue(db_path, processor, max_attempts=2, retry_base_seconds=0.01)
+    restarted.start()
+    assert (await restarted.wait("r-poison"))["status"] == "done"
+    assert restarted.failure_summary() == (0, None)
+    await restarted.close()
+
+

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **修复工程记忆超过候选上限时抛 `CodingDecisionError` 导致后台写入失败，并增强写入队列自愈**：
+  - `CodingMemoryReconciler`：当同一项目/分支累积的 `procedure` 当前版本超过 `reconcile_candidate_limit`（默认 64）时，旧实现先调用 `_fit` 截断页面却仍对被截掉的条目发题（提示词要求不确定时选 `INCLUDE`），且筛出的 `INCLUDE` 数一旦超过 `candidate_limit` 就直接抛 `CodingDecisionError: coding selected material exceeds candidate budget` 让整次写入失败；`MULTIPLE` 展开命中 0 个或多个 head / `UNSURE` 时也会抛 `CodingDecisionError` 中止整轮写入；同时 `0:target` 题干按固定 4000 字预留，候选项多时可能超出 `jev_max_question_chars`。现在分页严格保证题集与 `state["current"]` 一致、筛出项超上限时按 `(confidence, 新旧顺序)` 排序保留前 `candidate_limit` 条、`MULTIPLE` 无法唯一指向单个 head 时与 `NEED_CONTEXT` 一致退化为无 target 独立版本（不抛错）、`target` 阶段按实际最大单题长度裁剪最旧 head、原文加草稿超预算时优先用 `fit_dialogue` 压缩原文上下文。
+  - `HubWriteQueue`：默认 `max_attempts` 由 5 提升至 8（指数退避覆盖约 1 小时短暂断网/502 抖动）；Core 启动（`start()`）时自动重排非幂等冲突的历史 `failed` 任务；运行期间一旦有新的完整写入成功，自动给刚耗尽重试预算的 `failed` 任务补跑一次恢复探测（仍失败则停在 `max_attempts + 1` 不死循环），无需每次手动执行 `memhub retry`。
 - **修复 Hub 采集与写入边界的若干静默故障**：
   - 一个半写或格式异常的会话文件（如 Cline 正在重写的 `*.messages.json`）不再中止整轮 `memhub scan`：该文件跳过并计入 `errors`，游标不动，下次扫描重读；其余文件照常入库。Core 不可达仍会中止。
   - Hub 写入的幂等指纹只覆盖证据本身（`content` / `messages` / `session_id`），且按客户端提交的原文计算：重投时 `memory_at`（文件 mtime）、workspace 归一化结果或 `redact_secrets` 开关变化，不再触发永久 409。`hub.db` 旧行在启动时一次性迁移。

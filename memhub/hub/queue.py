@@ -59,7 +59,7 @@ class HubWriteQueue:
         path: Path,
         process: WriteProcessor,
         *,
-        max_attempts: int = 5,
+        max_attempts: int = 8,
         retry_base_seconds: float = 30.0,
         retry_max_seconds: float = 1800.0,
         on_idle: IdleHook | None = None,
@@ -111,6 +111,15 @@ class HubWriteQueue:
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
+        # Restarting the Core (after a config fix or upgrade) gives prior non-permanent
+        # failures a fresh run without requiring manual ``memhub retry``.
+        with self._conn:
+            self._conn.execute(
+                "UPDATE hub_writes SET status='pending',attempts=0,next_at=0,"
+                "error=NULL,updated_at=? WHERE status='failed' "
+                "AND (error IS NULL OR error NOT LIKE 'IdempotencyConflictError:%')",
+                (int(time.time()),),
+            )
         self._task = asyncio.create_task(self._run(), name="memhub-hub-writer")
         self._wake.set()
 
@@ -284,6 +293,7 @@ class HubWriteQueue:
         return str(row["request_id"]), payload
 
     def _finish_ok(self, request_id: str, *, raw_only: bool, result: dict) -> None:
+        now = int(time.time())
         with self._conn:
             # Raw evidence stored, but extraction was requested meanwhile: run again.
             self._conn.execute(
@@ -293,10 +303,21 @@ class HubWriteQueue:
                 (
                     int(raw_only),
                     json.dumps(result, ensure_ascii=False),
-                    int(time.time()),
+                    now,
                     request_id,
                 ),
             )
+            if not raw_only:
+                # Model providers just succeeded: give rows that exhausted their normal
+                # retry streak one recovery run. Keeping ``attempts = max_attempts``
+                # ensures a genuinely poisoned row becomes ``max_attempts + 1`` on
+                # failure and does not loop on later writes.
+                self._conn.execute(
+                    "UPDATE hub_writes SET status='pending',next_at=0,updated_at=? "
+                    "WHERE status='failed' AND attempts=? "
+                    "AND (error IS NULL OR error NOT LIKE 'IdempotencyConflictError:%')",
+                    (now, self._max_attempts),
+                )
 
     def _finish_error(self, request_id: str, exc: Exception) -> None:
         attempts = self._conn.execute(

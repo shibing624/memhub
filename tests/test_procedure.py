@@ -506,7 +506,7 @@ def test_settle_gives_each_head_one_retiring_claim():
     assert out[3] == ops[3]  # CONFLICT keeps both, it does not retire
 
 
-async def test_multiple_target_must_resolve_to_exactly_one_head():
+async def test_ambiguous_multiple_target_falls_back_to_independent_supplement():
     from memhub.coding.types import CodingMemory
 
     heads = [CodingMemory(memory_id=i, user_id="u", task=i) for i in ("a", "b")]
@@ -515,13 +515,20 @@ async def test_multiple_target_must_resolve_to_exactly_one_head():
     def decide(*, state, questions):
         if "0:target" in questions:
             return {"0:target": "MULTIPLE"}
+        if "0:action" in questions:
+            return {"0:action": "ADD_SUPPLEMENT"}
         return {q: "INCLUDE" for q in questions}
 
     reconciler = CodingMemoryReconciler(jev=FakeJev(decide))
-    with pytest.raises(CodingDecisionError, match="exactly one"):
-        await reconciler.reconcile(
-            [draft], heads, source_messages=[{"role": "user", "content": "x"}]
-        )
+    ops = await reconciler.reconcile(
+        [draft], heads, source_messages=[{"role": "user", "content": "x"}]
+    )
+    assert len(ops) == 1
+    assert (ops[0].action, ops[0].update_type, ops[0].target_memory_id) == (
+        "ADD",
+        "SUPPLEMENT",
+        None,
+    )
 
 
 def test_candidate_limit_is_validated():
@@ -640,3 +647,79 @@ def test_format_memories_labels_procedures_by_kind() -> None:
     )
     assert "- [fact] [user] 用户在做支付服务" in text
     assert "- [procedure] 去重：按 event_id 幂等" in text
+
+
+async def test_reconcile_bounds_selected_material_above_candidate_limit_and_fits_pages() -> None:
+    """When a project accumulates more procedures than ``candidate_limit`` and JEV
+    marks more than ``candidate_limit`` as INCLUDE, the reconciler paginates without
+    asking blind questions and bounds the kept heads by confidence + recency instead
+    of failing with ``coding selected material exceeds candidate budget``."""
+    from memhub.coding.types import CodingMemory
+    from memhub.providers.jev import JevAnswer
+
+    heads = [
+        CodingMemory(
+            memory_id=f"h-{idx:02d}",
+            user_id="u",
+            task=f"Task {idx}: " + ("x" * 180),
+            solution="s" * 400,
+            workspace_id="/repo",
+            branch="main",
+        )
+        for idx in range(25)
+    ]
+    draft = CodingMemoryDraft(
+        task="How to configure connection pooling",
+        solution="Set max_overflow=10",
+        workspace_id="/repo",
+        branch="main",
+    )
+    calls: list[tuple[dict, dict]] = []
+
+    def decide(*, state, questions):
+        calls.append((state, questions))
+        if "0:target" in questions:
+            return {"0:target": "h-22"}
+        if "0:action" in questions:
+            return {"0:action": "ADD_OVERRIDE"}
+        # Screening: mark EVERY head as INCLUDE; give h-22 and h-24 highest confidence.
+        out = {}
+        for qid in questions:
+            conf = 0.99 if qid in ("h-22", "h-24") else 0.75
+            out[qid] = JevAnswer(
+                type="choice",
+                choice="INCLUDE",
+                confidence=conf,
+                probabilities={"INCLUDE": conf, "EXCLUDE": round(1 - conf, 4)},
+            )
+        return out
+
+    max_chars = 10_000
+    reconciler = CodingMemoryReconciler(jev=FakeJev(decide), candidate_limit=6)
+    ops = await reconciler.reconcile(
+        [draft],
+        heads,
+        source_messages=[{"role": "user", "content": "pool config " * 200}],
+        max_state_chars=max_chars,
+    )
+    assert len(ops) == 1
+    assert (ops[0].action, ops[0].update_type, ops[0].target_memory_id) == (
+        "ADD",
+        "OVERRIDE",
+        "h-22",
+    )
+    for state, questions in calls:
+        present = {m["memory_id"] for m in state["current"]}
+        for qid, q in questions.items():
+            # Every screening question must correspond to a head actually in state["current"].
+            if qid.startswith("h-"):
+                assert qid in present
+            # State + individual question must stay within max_state_chars.
+            state_len = len(json.dumps(state, ensure_ascii=False, default=str))
+            q_len = len(json.dumps({qid: q}, ensure_ascii=False))
+            assert state_len + q_len <= max_chars
+        if "0:target" in questions:
+            offered = set(questions["0:target"]["criteria"]) - {"NONE", "MULTIPLE"}
+            assert len(offered) <= 6
+            assert {"h-22", "h-24"} <= offered
+
