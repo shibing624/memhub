@@ -180,6 +180,27 @@ def build_hub_mcp(
 
     @mcp.tool(
         description=(
+            "按记忆 ID（完整 ID 或 >=8 位前缀，如 [procedure-index id=a1b2c3d4] 或项目视图中的 id）"
+            "精确读取单条记忆的完整内容（含 procedure 的 task / solution / boundary_envs / files 及来源 L0 短 ID）。"
+            "当注入上下文仅展示目录标题索引且与当前任务相关时调用。" + _SCOPE_NOTE
+        )
+    )
+    async def memory_get(memory_id: str) -> dict:
+        async with core() as hub:
+            item = await _call(hub.get_memory(memory_id))
+        if not isinstance(item, dict) or item.get("ok") is False:
+            return item
+        ref = _source_ref(item)
+        return {
+            "ok": True,
+            "memory": {
+                **item,
+                **({"source_id": ref} if ref else {}),
+            },
+        }
+
+    @mcp.tool(
+        description=(
             "列出当前生效的记忆条目及其 id，用于「改掉 / 撤销 / 更新 / 忘掉 / 删掉」"
             "某条约定时定位目标。query 为可选关键词（内容子串匹配），不传则按时间倒序返回最近 limit 条；"
             "返回的 id 可交给 memory_update / memory_delete。"

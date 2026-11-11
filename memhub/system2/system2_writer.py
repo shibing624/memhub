@@ -31,6 +31,7 @@ class System2Writer:
         messages: list[ChatMessage] | None = None,
         workspace_id: str | None = None,
         workspace_remote: str | None = None,
+        tool_signals: list[dict] | None = None,
     ) -> WriterOutcome:
         result = await self.inner.write(
             content=content,
@@ -43,6 +44,7 @@ class System2Writer:
             messages=messages,
             workspace_id=workspace_id,
             workspace_remote=workspace_remote,
+            tool_signals=tool_signals,
         )
         if result.commit_passed:
             self.factory.cache.enqueue_s2_task(
@@ -62,6 +64,7 @@ class System2Writer:
         memory_at: int | None = None,
         workspace_id: str | None = None,
         workspace_remote: str | None = None,
+        tool_signals: list[dict] | None = None,
     ) -> WriterOutcome:
         return await self.inner.write_raw(
             content=content,
@@ -73,6 +76,7 @@ class System2Writer:
             memory_at=memory_at,
             workspace_id=workspace_id,
             workspace_remote=workspace_remote,
+            tool_signals=tool_signals,
         )
 
     async def distill(

@@ -63,6 +63,7 @@ class MemoryWriter:
         messages: list[ChatMessage] | None = None,
         workspace_id: str | None = None,
         workspace_remote: str | None = None,
+        tool_signals: list[dict] | None = None,
     ) -> WriterOutcome:
         scope = (app_id, user_id, agent_id)
         key = "request:" + json.dumps([scope, request_id])
@@ -95,7 +96,16 @@ class MemoryWriter:
                     node_id=raw_id,
                     workspace_id=workspace_id,
                     workspace_remote=workspace_remote,
+                    tool_signals=tool_signals,
                 )
+            elif tool_signals and not (raw.custom or {}).get("tool_signals"):
+                merged_custom = {**(raw.custom or {}), "tool_signals": tool_signals}
+                await asyncio.to_thread(
+                    self.factory.vector.update_payload,
+                    raw.node_id,
+                    {"custom": json.dumps(merged_custom, ensure_ascii=False)},
+                )
+                raw.custom = merged_custom
             # Failed model work leaves original evidence available for retry; a
             # committed plan is recovered from the plan journal by run_system1.
             ids, commit, ephemeral = await self.agent.run_system1(
@@ -122,6 +132,7 @@ class MemoryWriter:
         node_id: str | None = None,
         workspace_id: str | None = None,
         workspace_remote: str | None = None,
+        tool_signals: list[dict] | None = None,
     ) -> MemoryNode:
         raw = MemoryNode(
             content=content,
@@ -141,6 +152,7 @@ class MemoryWriter:
                 for k, v in (
                     ("workspace_id", workspace_id),
                     ("workspace_remote", workspace_remote),
+                    ("tool_signals", tool_signals),
                 )
                 if v
             }
@@ -171,6 +183,7 @@ class MemoryWriter:
         memory_at: int | None = None,
         workspace_id: str | None = None,
         workspace_remote: str | None = None,
+        tool_signals: list[dict] | None = None,
     ) -> WriterOutcome:
         """Store L0 evidence under ``request_id`` without extraction.
 
@@ -205,6 +218,7 @@ class MemoryWriter:
                     node_id=raw_id,
                     workspace_id=workspace_id,
                     workspace_remote=workspace_remote,
+                    tool_signals=tool_signals,
                 )
             elif (
                 raw.content != content

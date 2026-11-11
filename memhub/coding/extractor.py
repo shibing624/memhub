@@ -14,16 +14,22 @@ from memhub.providers.llm import LLMClient
 _EXTRACT_PROMPT = """Generate candidate procedure memories from the source JSON.
 The source is a coding session between a user and a coding agent: the user's
 requests and the answers the agent gave (tool calls are already left out).
-A procedure is reusable engineering experience from it: how a task was solved, the
-root cause, the working commands/configuration, a decision with its reason, or an
-approach that failed and why. The user's requests and decisions are the primary
-evidence; take details from the answers only as far as the user saw them.
-Only produce candidate text, never decide persistence value, knownness, updates,
-actions or targets. Include every potentially useful explicit engineering fact,
-constraint, decision, changed solution and distinct event. Do not filter trivial
-or already documented information: JEV will decide its value and coverage.
-Personal preferences, identity and plans of the user are stored by another
-extractor; do not restate them here unless they are an engineering constraint.
+A procedure is durable, reusable engineering experience (latent rules and non-obvious
+lessons): how a non-trivial bug or failure was diagnosed and solved, its root cause,
+verified project commands/configurations, architectural or design decisions with
+their rationale, explicit engineering rules/constraints set by the user, environment
+gotchas, or an approach that failed and why it must be avoided.
+Distinguish durable latent rules from ephemeral session state: skip facts that a
+future agent can trivially see by reading the current files, routine mechanical
+edits/renames with no non-obvious lesson, transient status narration, or unverified
+speculation. Do not self-censor genuine rules or solutions merely because they might
+already exist in memory: JEV independently decides knownness, coverage and version
+updates against existing heads.
+The user's requests, corrections and decisions are the primary evidence; take details
+from the assistant's answers only as far as they reflect verified outcomes or rules
+presented to the user. Personal lifestyle preferences, identity and non-engineering
+plans of the user are stored by another extractor; do not restate them here unless
+they constrain engineering work.
 Preserve complete commands, paths, numbers, reasons, environment boundaries and
 qualifications. Do not invent missing details.
 Write every text field in the language of the user's messages; do not translate.
@@ -37,7 +43,7 @@ Output a JSON object {"candidates": [...]}, each candidate an object with:
 - boundary_envs: string, environment constraints in one sentence ("" if none)
 - boundary_scope: one of "strict" | "project" | "user" | "global"
 - confidence: number in [0, 1]
-Return an empty candidates array only when the source has no engineering content.
+Return an empty candidates array when the source contains only ephemeral edits or no durable engineering knowledge.
 """
 
 

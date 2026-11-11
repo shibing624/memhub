@@ -14,6 +14,7 @@ from __future__ import annotations
 import configparser
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +126,110 @@ def resolve_workspace_root(workspace: str | Path) -> str:
     if info is not None:
         return str(info[0])
     return str(Path(raw).expanduser())
+
+
+def git_head_branch(workspace: str | Path) -> str | None:
+    """Current local branch or short detached commit of ``workspace``, without git subprocess."""
+    try:
+        current = Path(workspace).expanduser().absolute()
+    except OSError:
+        return None
+    for _ in range(64):
+        git_entry = current / ".git"
+        head_file: Path | None = None
+        if git_entry.is_dir():
+            head_file = git_entry / "HEAD"
+        elif git_entry.is_file():
+            try:
+                raw = git_entry.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                raw = ""
+            if raw.startswith("gitdir:"):
+                gitdir = Path(os.path.normpath(str(current / raw[len("gitdir:") :].strip())))
+                head_file = gitdir / "HEAD"
+        if head_file is not None and head_file.is_file():
+            try:
+                head = head_file.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                return None
+            if head.startswith("ref: refs/heads/"):
+                return head[len("ref: refs/heads/") :]
+            if head.startswith("ref: "):
+                return head[len("ref: ") :]
+            return head[:8] if head else None
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+def inspect_local_procedure_files(
+    procedure: dict[str, Any] | None,
+    workspace: str | None = None,
+) -> dict[str, Any] | None:
+    """Device-local, non-replicated check of whether a project procedure's referenced
+    files exist in the local checkout right now.
+
+    General user/global conventions are never flagged by file presence. Returns None
+    when the checkout is not present on this device or all referenced repo files exist.
+    """
+    if not isinstance(procedure, dict):
+        return None
+    scope = str(procedure.get("boundary_scope") or "project")
+    if scope in ("user", "global"):
+        return None
+    files = [str(f).strip() for f in (procedure.get("files") or []) if str(f).strip()]
+    if not files:
+        return None
+    proc_ws = str(procedure.get("workspace_id") or "").strip()
+    target_ws = str(workspace or proc_ws).strip()
+    if not target_ws:
+        return None
+    if workspace and proc_ws and not (workspace_keys(workspace) & workspace_keys(proc_ws)):
+        return None
+    try:
+        checkout = Path(target_ws).expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    if not checkout.is_dir():
+        return None
+    try:
+        if not any(checkout.iterdir()):
+            return None
+    except OSError:
+        return None
+
+    repo_root = Path(resolve_workspace_root(str(checkout))).resolve(strict=False)
+    missing: list[str] = []
+    present: list[str] = []
+    for raw_path in files:
+        p = Path(raw_path)
+        if p.is_absolute():
+            resolved = p.resolve(strict=False)
+            if not (resolved == repo_root or repo_root in resolved.parents):
+                continue
+            rel = str(resolved.relative_to(repo_root))
+            target = resolved
+        else:
+            rel = raw_path
+            target = repo_root / raw_path
+        if target.exists():
+            present.append(rel)
+        else:
+            missing.append(rel)
+
+    if not missing:
+        return None
+    return {
+        "checked_at": int(time.time()),
+        "workspace": str(repo_root),
+        "branch": git_head_branch(checkout),
+        "recorded_branch": procedure.get("branch"),
+        "missing_files": missing,
+        "present_files": present,
+        "all_missing": not present,
+    }
 
 
 def git_remote_slug(workspace: str | Path) -> str | None:
@@ -256,6 +361,30 @@ def workspace_sessions(nodes: list[MemoryNode], workspace: str) -> list[str]:
     return sorted(sessions)
 
 
+def matching_workspace_nodes(
+    nodes: list[MemoryNode],
+    workspace: str,
+    *,
+    session_ids: set[str] | None = None,
+) -> list[MemoryNode]:
+    """Subset of ``nodes`` belonging to ``workspace`` (by workspace boundary or session)."""
+    keys_cache: dict[str, set[str]] = {}
+    git_cache: dict[str, tuple[bool, bool, str]] = {}
+    sessions = session_ids or set()
+    matched: list[MemoryNode] = []
+    for node in nodes:
+        if node.session_id and node.session_id in sessions:
+            matched.append(node)
+            continue
+        found = node_workspace(node)
+        if not found:
+            continue
+        remote = str((node.custom or {}).get("workspace_remote") or "")
+        if _workspaces_match(found, remote, workspace, keys_cache, git_cache):
+            matched.append(node)
+    return matched
+
+
 def browse_rows(nodes: list[MemoryNode]) -> list[dict[str, Any]]:
     """Every version, newest first, with its project and source host."""
     by_source = workspaces_by_source(nodes)
@@ -314,7 +443,10 @@ __all__ = [
     "browse_rows",
     "canonical_workspace",
     "current_rows",
+    "git_head_branch",
     "git_remote_slug",
+    "inspect_local_procedure_files",
+    "matching_workspace_nodes",
     "node_workspace",
     "parse_origin_slug",
     "resolve_workspace_root",

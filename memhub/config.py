@@ -269,6 +269,12 @@ class Settings(BaseSettings):
     # user text is kept first. Leaves room for drafts and heads inside
     # ``jev_max_question_chars``.
     procedure_source_max_chars: int = 24_000
+    # Hub prompt-hook progressive disclosure (experimental calibration knobs):
+    # shared char/line cap across project view + dynamic recall + L0 excerpts,
+    # and score threshold above which procedures expand their full solution.
+    hub_inject_max_chars: int = 3_000
+    hub_inject_max_lines: int = 120
+    hub_procedure_full_score: float = 0.40
 
     @field_validator(
         "jev_timeout",
@@ -295,18 +301,18 @@ class Settings(BaseSettings):
             raise ValueError("decision and cognition limits must be positive")
         return value
 
-    @field_validator("request_outcome_ttl_seconds")
+    @field_validator("request_outcome_ttl_seconds", "hub_inject_max_chars", "hub_inject_max_lines")
     @classmethod
     def _non_negative(cls, value: int) -> int:
         if value < 0:
             raise ValueError("must be non-negative")
         return value
 
-    @field_validator("reconcile_review_confidence")
+    @field_validator("reconcile_review_confidence", "hub_procedure_full_score")
     @classmethod
     def _probability(cls, value: float) -> float:
         if not 0.0 <= value <= 1.0:
-            raise ValueError("reconcile_review_confidence must be within [0, 1]")
+            raise ValueError("probability/score threshold must be within [0, 1]")
         return value
 
     @field_validator("reconcile_candidate_limit")

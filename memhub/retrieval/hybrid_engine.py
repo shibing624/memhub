@@ -237,6 +237,147 @@ def source_excerpt(content: str, query: str, anchors: list[str], max_chars: int 
     return "\n[…]\n".join(passages[i] for i in sorted(selected))
 
 
+def _strip_retired_clauses(content: str, retired_only_terms: set[str]) -> str:
+    """Remove sentences/clauses carrying terms unique to superseded or deleted claims."""
+    if not retired_only_terms:
+        return content
+    kept_turns: list[str] = []
+    for turn in re.split(r"(?m)(?=^\[(?:user|assistant|tool|system)\]:)", content):
+        if not turn.strip():
+            continue
+        m = re.match(r"^(\[\w+\]:\s*)([\s\S]*)$", turn.strip())
+        prefix, body = (m.group(1), m.group(2)) if m else ("", turn.strip())
+        kept_sentences: list[str] = []
+        for sent in re.split(r"(?<=[。！？.!?\n；;])\s*", body):
+            if not sent.strip():
+                continue
+            stoks = set(tokenize(sent))
+            if not (stoks & retired_only_terms):
+                kept_sentences.append(sent.strip())
+                continue
+            # A compound sentence ("超时设 2500ms，顺便修 keepalive") may mix a retired
+            # clause with an unrelated clause; keep clauses free of retired-only terms.
+            clauses = [
+                c.strip()
+                for c in re.split(r"[，,]", sent)
+                if c.strip() and not (set(tokenize(c)) & retired_only_terms)
+            ]
+            if clauses:
+                kept_sentences.append("，".join(clauses))
+        if kept_sentences:
+            kept_turns.append(f"{prefix}{' '.join(kept_sentences)}".strip())
+    return "\n".join(kept_turns)
+
+
+def novel_source_excerpt(
+    content: str,
+    query: str,
+    covered_texts: list[str],
+    max_chars: int = 480,
+    *,
+    retired_texts: list[str] | None = None,
+) -> str:
+    """Compress a same-source L0 dialogue to passages NOT already covered by recalled items.
+
+    A single L0 batch can hold several turns, dates, conditions or failure steps while
+    structured recall matched only one fact or procedure from it. Passages whose terms
+    are already covered verbatim are skipped, clauses carrying terms unique to retired
+    (superseded / negated / deleted) claims are stripped so stale rules never resurrect,
+    and remaining passages relevant to ``query`` are kept within ``max_chars``.
+    """
+    if max_chars <= 0 or not content.strip():
+        return ""
+    retired = [t for t in (retired_texts or []) if t and t.strip()]
+    active_terms = set(tokenize(" ".join(covered_texts)))
+    if retired:
+        retired_only = set(tokenize(" ".join(retired))) - active_terms
+        content = _strip_retired_clauses(content, retired_only)
+        if not content.strip():
+            return ""
+    all_covered = [*covered_texts, *retired]
+    if not all_covered:
+        return source_excerpt(content, query, [], max_chars)
+
+    covered_terms = set(tokenize(" ".join(all_covered)))
+    if not covered_terms:
+        return source_excerpt(content, query, [], max_chars)
+
+    turns = re.split(r"(?m)(?=^\[(?:user|assistant|tool|system)\]:)", content)
+    passages: list[str] = []
+    roles: list[str] = []
+    for turn in turns:
+        if not turn.strip():
+            continue
+        label = re.match(r"\[(\w+)\]:", turn)
+        role = label.group(1) if label else ""
+        start = 0
+        while start < len(turn):
+            end = min(start + 420, len(turn))
+            if end < len(turn):
+                boundary = turn.rfind(" ", start + 200, end)
+                if boundary > start:
+                    end = boundary
+            chunk = turn[start:end].strip()
+            if start and role:
+                chunk = f"[{role}]: […] {chunk}"
+            if chunk:
+                passages.append(chunk)
+                roles.append(role)
+            start = end
+    if not passages:
+        return ""
+
+    novelties: list[float] = []
+    for p in passages:
+        body = re.sub(r"^\[(?:\w+)\]:\s*(?:\[…\]\s*)?", "", p)
+        ptoks = tokenize(body)
+        if not ptoks:
+            novelties.append(0.0)
+            continue
+        overlap = sum(1 for t in ptoks if t in covered_terms) / len(ptoks)
+        novelties.append(max(0.0, 1.0 - overlap))
+
+    # Every passage is already stated almost word-for-word in the recalled memories.
+    if max(novelties, default=0.0) < 0.20:
+        return ""
+
+    q_terms = tokenize(query)
+    q_scores = compute_bm25_scores(q_terms, passages) if q_terms else [0.0] * len(passages)
+    q_max = max(q_scores, default=0.0) or 1.0
+
+    candidates = [i for i, nov in enumerate(novelties) if nov >= 0.20]
+    ranked = sorted(
+        candidates,
+        key=lambda i: -((q_scores[i] / q_max) * (0.4 + 0.6 * novelties[i]) + 0.25 * novelties[i]),
+    )
+    selected: set[int] = set()
+    size = 0
+    for index in ranked:
+        neighbours = [index]
+        if (
+            roles[index] == "assistant"
+            and index > 0
+            and roles[index - 1] == "user"
+            and novelties[index - 1] >= 0.15
+        ):
+            neighbours.append(index - 1)
+        for i in neighbours:
+            if i in selected:
+                continue
+            piece = passages[i]
+            if not selected and len(piece) > max_chars:
+                piece = piece[: max_chars - 1] + "…"
+                passages[i] = piece
+            if size + len(piece) + (8 if selected else 0) <= max_chars:
+                selected.add(i)
+                size += len(piece) + (8 if len(selected) > 1 else 0)
+        if len(selected) >= 2:
+            break
+    if not selected:
+        return ""
+    return "\n[…]\n".join(passages[i] for i in sorted(selected))
+
+
 def _item_to_memory(item: dict) -> MemoryItem:
     if item.get("node") is None:
         item = _derived_to_item(item)

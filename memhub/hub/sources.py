@@ -55,11 +55,13 @@ from typing import Any, BinaryIO, Protocol
 import zstandard
 
 from memhub.client import strip_memory_injection
+from memhub.coding.preproc import extract_tool_signals
 from memhub.hub.browse import canonical_workspace
 from memhub.hub.config import CursorStore
 from memhub.hub.redact import sanitize_text, strip_image_payloads
 
 logger = logging.getLogger(__name__)
+_SIGNAL_EXIT_RE = re.compile(r"(?m)^(?:Exit code|exit_code):\s*(-?\d+)\s*$")
 
 SOURCES = (
     "agentica",
@@ -126,6 +128,7 @@ class HubWriter(Protocol):
         raw_only: bool = False,
         workspace_id: str | None = None,
         branch: str | None = None,
+        tool_signals: list[dict] | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -142,6 +145,7 @@ class Message:
     steps: tuple[dict, ...] = ()
     workspace: str | None = None
     branch: str | None = None
+    signals: tuple[dict, ...] = ()
 
 
 @dataclass
@@ -155,6 +159,7 @@ class Turn:
     steps: list[dict] = field(default_factory=list)
     workspace: str | None = None
     branch: str | None = None
+    signals: list[dict] = field(default_factory=list)
 
     def messages(self) -> list[dict]:
         out: list[dict] = [{"role": "user", "content": self.user}, *self.steps]
@@ -221,6 +226,41 @@ def _tool_call(call_id: str, name: str, arguments: Any) -> dict:
 
 
 
+def _error_preview(raw: Any) -> str:
+    """Sanitized single-line failure summary (<=200 chars) from a failed tool output."""
+    text = ""
+    if isinstance(raw, dict):
+        for key in ("error", "stderr", "message", "detail", "output"):
+            val = raw.get(key)
+            if isinstance(val, str) and val.strip():
+                text = val
+                break
+    elif isinstance(raw, list):
+        text = _blocks_text(raw)
+    elif isinstance(raw, str):
+        stripped = raw.strip()
+        if stripped.startswith("{") and stripped.endswith("}") and len(stripped) <= 32_768:
+            try:
+                loaded = json.loads(stripped)
+            except json.JSONDecodeError:
+                loaded = None
+            if isinstance(loaded, dict):
+                return _error_preview(loaded)
+        text = raw
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return ""
+    lines = [
+        ln.strip()
+        for ln in cleaned.splitlines()
+        if ln.strip() and not _SIGNAL_EXIT_RE.match(ln.strip())
+    ]
+    if not lines:
+        return ""
+    joined = " ".join(" | ".join(lines[-2:]).split())
+    return joined[:199] + "…" if len(joined) > 200 else joined
+
+
 def _parse_agentica(record: dict, state: dict) -> tuple[str, str, str, int | None] | None:
     kind = record.get("type")
     if kind not in ("user", "assistant", "tool"):
@@ -232,8 +272,30 @@ def _parse_agentica(record: dict, state: dict) -> tuple[str, str, str, int | Non
     session_id = record.get("session_id") or state["session_id"]
     at = _iso_seconds(record.get("timestamp"))
     if kind == "tool":
-        # Tool output is how the answer was reached, never memory material.
-        return None
+        raw_out = _blocks_text(record.get("content")) or record.get("content") or record.get("output")
+        is_err = (
+            record.get("is_error") is True
+            or record.get("status") in ("error", "failed")
+            or bool(record.get("error"))
+        )
+        code = _output_exit_code(raw_out)
+        if not is_err and code is None:
+            return None
+        ok = (not is_err) and (code in (None, 0))
+        sig: dict[str, Any] = {
+            "call_id": str(record.get("tool_call_id") or record.get("id") or ""),
+            "tool": str(record.get("name") or record.get("tool_name") or ""),
+            "at": at,
+            "ok": ok,
+        }
+        if code is not None:
+            sig["exit_code"] = code
+        if not ok:
+            err = _error_preview(record.get("error") or raw_out)
+            if err:
+                sig["error"] = err
+        state["signals"].append(sig)
+        return "assistant", "", session_id, at
     for call in record.get("tool_calls") or []:
         function = call.get("function") or {}
         state["steps"].append(
@@ -247,9 +309,34 @@ def _parse_agentica(record: dict, state: dict) -> tuple[str, str, str, int | Non
     )
 
 
+def _output_exit_code(raw: Any) -> int | None:
+    """Extract an explicit integer exit_code from structured JSON or shell header."""
+    if isinstance(raw, dict):
+        code = raw.get("exit_code")
+        if code is None and isinstance(raw.get("metadata"), dict):
+            code = raw["metadata"].get("exit_code")
+        return code if isinstance(code, int) and not isinstance(code, bool) else None
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if stripped.startswith("{") and stripped.endswith("}") and len(stripped) <= 32_768:
+            try:
+                loaded = json.loads(stripped)
+            except json.JSONDecodeError:
+                loaded = None
+            if isinstance(loaded, dict):
+                found = _output_exit_code(loaded)
+                if found is not None:
+                    return found
+        match = _SIGNAL_EXIT_RE.search(raw)
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def _parse_claude(record: dict, state: dict) -> tuple[str, str, str, int | None] | None:
     if record.get("type") not in ("user", "assistant") or record.get("isSidechain") or record.get("isMeta"):
         return None
+    at = _iso_seconds(record.get("timestamp"))
     content = (record.get("message") or {}).get("content")
     for block in content if isinstance(content, list) else []:
         if not isinstance(block, dict):
@@ -258,6 +345,24 @@ def _parse_claude(record: dict, state: dict) -> tuple[str, str, str, int | None]
             state["steps"].append(
                 _tool_call(str(block.get("id") or ""), str(block.get("name") or ""), block.get("input") or {})
             )
+        elif block.get("type") == "tool_result":
+            raw_res = _blocks_text(block.get("content")) or block.get("content")
+            is_err = block.get("is_error") is True
+            code = _output_exit_code(raw_res)
+            if is_err or code is not None:
+                ok = (not is_err) and (code in (None, 0))
+                sig: dict[str, Any] = {
+                    "call_id": str(block.get("tool_use_id") or ""),
+                    "at": at,
+                    "ok": ok,
+                }
+                if code is not None:
+                    sig["exit_code"] = code
+                if not ok:
+                    err = _error_preview(raw_res)
+                    if err:
+                        sig["error"] = err
+                state["signals"].append(sig)
     if record.get("cwd"):
         state["workspace"] = record["cwd"]
     if record.get("gitBranch"):
@@ -267,7 +372,7 @@ def _parse_claude(record: dict, state: dict) -> tuple[str, str, str, int | None]
         record["type"],
         _strip_tags(text, _CLAUDE_MARKUP),
         record.get("sessionId") or state["session_id"],
-        _iso_seconds(record.get("timestamp")),
+        at,
     )
 
 
@@ -291,6 +396,27 @@ def _parse_codebuddy(record: dict, state: dict) -> tuple[str, str, str, int | No
                 record.get("arguments") or {},
             )
         )
+        return "assistant", "", session_id, at
+    if kind == "function_call_result":
+        raw_out = record.get("output")
+        is_err = record.get("isError") is True or record.get("status") in ("error", "failed")
+        code = _output_exit_code(raw_out)
+        if not is_err and code is None:
+            return None
+        ok = (not is_err) and (code in (None, 0))
+        sig = {
+            "call_id": str(record.get("callId") or record.get("id") or ""),
+            "tool": str(record.get("name") or ""),
+            "at": at,
+            "ok": ok,
+        }
+        if code is not None:
+            sig["exit_code"] = code
+        if not ok:
+            err = _error_preview(raw_out)
+            if err:
+                sig["error"] = err
+        state["signals"].append(sig)
         return "assistant", "", session_id, at
     role = record.get("role")
     if kind != "message" or role not in ("user", "assistant"):
@@ -320,6 +446,33 @@ def _parse_codex(record: dict, state: dict) -> tuple[str, str, str, int | None] 
                 str(payload.get("name") or ""),
                 payload.get("arguments", payload.get("input")),
             ))
+        elif kind in ("function_call_output", "custom_tool_call_output"):
+            raw_out = payload.get("output")
+            at = _iso_seconds(record.get("timestamp"))
+            code = _output_exit_code(raw_out)
+            is_err = payload.get("is_error") is True or payload.get("status") in ("error", "failed")
+            if not is_err and isinstance(raw_out, str) and raw_out.strip().startswith("{"):
+                try:
+                    loaded = json.loads(raw_out)
+                except json.JSONDecodeError:
+                    loaded = None
+                if isinstance(loaded, dict) and (loaded.get("is_error") is True or bool(loaded.get("error"))):
+                    is_err = True
+            if code is None and not is_err:
+                return None
+            ok = (not is_err) and (code in (None, 0))
+            sig = {
+                "call_id": str(payload.get("call_id") or ""),
+                "at": at,
+                "ok": ok,
+            }
+            if code is not None:
+                sig["exit_code"] = code
+            if not ok:
+                err = _error_preview(raw_out)
+                if err:
+                    sig["error"] = err
+            state["signals"].append(sig)
         else:
             return None
         return "assistant", "", state["session_id"], _iso_seconds(record.get("timestamp"))
@@ -470,16 +623,18 @@ def _read_stream(
         line_start, position = position, position + len(line)
         record = _record(line)
         state["steps"] = []
+        state["signals"] = []
         parsed = parse(record, state) if record is not None else None
         if parsed is None:
             continue
         role, text, session_id, at = parsed
         text = _clean_text(text)
         steps = tuple(state["steps"])
-        if text or steps:
+        signals = tuple(state["signals"])
+        if text or steps or signals:
             messages.append(Message(
                 role, text, session_id, at, line_start, position,
-                steps, state["workspace"], state["branch"],
+                steps, state["workspace"], state["branch"], signals,
             ))
     return messages, position
 
@@ -492,7 +647,7 @@ def _read_jsonl(
     ``seed`` adds per-file context to the parser state (Cursor's project and time).
     """
     state: dict[str, Any] = {
-        "session_id": path.stem, "steps": [], "workspace": None, "branch": None,
+        "session_id": path.stem, "steps": [], "signals": [], "workspace": None, "branch": None,
         **seed,
     }
     with path.open("rb") as fp:
@@ -571,10 +726,39 @@ def _parse_pi(record: dict, state: dict) -> tuple[str, str, str, int | None] | N
         state["session_id"] = record["id"]
         state["workspace"] = record.get("cwd")
         return None
+    if kind == "bashExecution" and isinstance(record.get("exitCode"), int) and not isinstance(record.get("exitCode"), bool):
+        code = record["exitCode"]
+        at = _ms_seconds(record.get("timestamp"))
+        sig = {
+            "tool": "bash",
+            "target": str(record.get("command") or "")[:120],
+            "at": at,
+            "ok": code == 0,
+            "exit_code": code,
+        }
+        if code != 0:
+            err = _error_preview(record.get("output"))
+            if err:
+                sig["error"] = err
+        state["signals"].append(sig)
+        return "assistant", "", state["session_id"], at
     if kind != "message":
         return None
     message = record["message"]
     role = message["role"]
+    if role == "toolResult" and message.get("isError") is True:
+        at = _ms_seconds(message.get("timestamp"))
+        sig = {
+            "call_id": str(message.get("toolCallId") or ""),
+            "tool": str(message.get("toolName") or "tool"),
+            "at": at,
+            "ok": False,
+        }
+        err = _error_preview(message.get("content"))
+        if err:
+            sig["error"] = err
+        state["signals"].append(sig)
+        return "assistant", "", state["session_id"], at
     if role not in ("user", "assistant"):
         return None
     at = _ms_seconds(message.get("timestamp"))
@@ -631,6 +815,18 @@ def _parse_copilot(record: dict, state: dict) -> tuple[str, str, str, int | None
         state["steps"].append(
             _tool_call(str(data.get("toolCallId") or ""), str(data.get("toolName") or ""), args)
         )
+        return "assistant", "", state["session_id"], at
+    if kind == "tool.execution_complete" and data.get("success") is False:
+        sig = {
+            "call_id": str(data.get("toolCallId") or ""),
+            "tool": str(data.get("toolName") or "tool"),
+            "at": at,
+            "ok": False,
+        }
+        err = _error_preview(data.get("error") or data.get("result"))
+        if err:
+            sig["error"] = err
+        state["signals"].append(sig)
         return "assistant", "", state["session_id"], at
     if kind == "assistant.message":
         for req in data.get("toolRequests") or []:
@@ -733,6 +929,7 @@ def _read_cline(path: Path, start: int) -> tuple[list[Message], int]:
         at = _ms_seconds(msg.get("ts")) or base_at
         content = msg.get("content")
         steps = []
+        signals = []
         if role == "assistant" and isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -749,10 +946,18 @@ def _read_cline(path: Path, start: int) -> tuple[list[Message], int]:
                             inp,
                         )
                     )
+        elif role == "user" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error") is True:
+                    sig = {"call_id": str(block.get("tool_use_id") or ""), "at": at, "ok": False}
+                    err = _error_preview(block.get("content"))
+                    if err:
+                        sig["error"] = err
+                    signals.append(sig)
         text = _clean_text(_blocks_text(content))
-        if text or steps:
+        if text or steps or signals:
             messages.append(
-                Message(role, text, session_id, at, idx, idx + 1, tuple(steps), workspace)
+                Message(role, text, session_id, at, idx, idx + 1, tuple(steps), workspace, None, tuple(signals))
             )
     return messages, len(items)
 
@@ -823,7 +1028,7 @@ def _read_dsh(path: Path, start: int) -> tuple[list[Message], int]:
     """Cursor positions are offsets into the decompressed events."""
     raw = _unzstd(path)
     state: dict[str, Any] = {
-        "session_id": path.parent.name, "steps": [], "workspace": None, "branch": None,
+        "session_id": path.parent.name, "steps": [], "signals": [], "workspace": None, "branch": None,
     }
     return _read_stream(io.BytesIO(raw), len(raw), start, _parse_dsh, state)
 
@@ -879,10 +1084,25 @@ def _read_opencode(path: Path, start: int) -> tuple[list[Message], int]:
                 )
         elif role == "assistant" and kind == "tool":
             # Arguments locate the files touched; a write's ``content`` is output, not kept.
-            inp = {k: v for k, v in part["state"]["input"].items() if k != "content"}
-            step = _tool_call(str(part.get("callID") or ""), str(part.get("tool") or ""), inp)
+            state_obj = part["state"]
+            inp = {k: v for k, v in state_obj["input"].items() if k != "content"}
+            call_id = str(part.get("callID") or "")
+            tool_name = str(part.get("tool") or "")
+            step = _tool_call(call_id, tool_name, inp)
+            sig = ()
+            if state_obj.get("status") == "error":
+                err = _error_preview(state_obj.get("error") or state_obj.get("output"))
+                sig = (
+                    {
+                        "call_id": call_id,
+                        "tool": tool_name or "tool",
+                        "at": at,
+                        "ok": False,
+                        **({"error": err} if err else {}),
+                    },
+                )
             messages.append(
-                Message("assistant", "", session_id, at, row_id - 1, row_id, (step,), workspace)
+                Message("assistant", "", session_id, at, row_id - 1, row_id, (step,), workspace, None, sig)
             )
     return messages, rows[-1][0] if rows else start
 
@@ -1068,6 +1288,7 @@ def build_turns(messages: list[Message]) -> tuple[list[Turn], Turn | None]:
                 current.workspace = workspace or current.workspace
         elif current is not None and current.session_id == msg.session_id:
             current.steps.extend(msg.steps)
+            current.signals.extend(msg.signals)
             if msg.role == "assistant" and msg.text:
                 current.assistant = msg.text
             current.end = msg.end
@@ -1132,6 +1353,13 @@ async def scan_file(
             stop = turns[-1].end
         for batch in _batches(turns, batch_turns):
             messages_in = [m for turn in batch for m in turn.messages()]
+            raw_signals = [s for turn in batch for s in turn.signals]
+            resolved_signals = (
+                extract_tool_signals(messages_in, extra=raw_signals)
+                if raw_signals
+                else []
+            )
+            extra_kw = {"tool_signals": resolved_signals} if resolved_signals else {}
             session_id = f"{source}:{batch[0].session_id}"
             request_id = hashlib.sha256(
                 json.dumps(
@@ -1155,6 +1383,7 @@ async def scan_file(
                 raw_only=raw_only,
                 workspace_id=batch[-1].workspace,
                 branch=batch[-1].branch,
+                **extra_kw,
             )
             cursors.advance(source, key, batch[-1].end, len(batch))
         cursors.advance(source, key, stop, 0)

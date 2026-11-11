@@ -19,8 +19,9 @@ description: 用户的全局个人记忆（memhub MemHub，跨 Agentica / Claude
 
 | 用户意图 | MCP 工具（`memhub`） | 说明 |
 |---|---|---|
+| 按记忆 ID 精确展开目录条目（渐进式披露） | `memory_get(memory_id="a1b2c3d4")` | 看到 `<relevant-memories>` 里的 `[procedure-index id=a1b2c3d4]` 或项目视图条目需要完整方案时，直接按 ID 精确读取 |
 | 查偏好、画像、事实、历史结论 | `memory_search(query="...")` | 语义检索当前记忆，返回带 `id` 和 `source_id` 的列表 |
-| 按 L0 来源 ID 展开完整原话（渐进式披露） | `conversation_search(source_id="37c85fe9", context_turns=1)` | 看到 `<relevant-memories>` 里的 `(来源: L0 37c85fe9)` 或 `memory_search` 的 `source_id` 想核对完整原话及前后轮次时按需调用 |
+| 按 L0 来源 ID 展开完整原话（渐进式披露） | `conversation_search(source_id="37c85fe9", context_turns=1)` | 看到 `<relevant-memories>` 里的 `(来源: L0 37c85fe9)` 或 `source_id` 想核对完整原话及前后轮次时按需调用 |
 | 查「我之前说过 / 问过什么」的原话 | `conversation_search(query="...")` | 返回历史对话原文；`session_id` 形如 `codex:<id>`，冒号前是来源工具 |
 | 记住 / 别忘了 / 以后都按这个 | `memory_add(content="...")` | `content` 写成一条完整、可独立理解的第三人称陈述句 |
 | 改掉 / 撤销 / 更新某条约定 | `memory_list(query="...")` 取 `id` → `memory_update(memory_id=id, content="...")` | 找不到匹配项就直接 `memory_add` 写新约定 |
@@ -39,6 +40,7 @@ CLI 入口是 `python3 -m memhub.cli <子命令>`，安装后也可直接 `memhu
 
 | 要做的事 | 命令 |
 |---|---|
+| 按记忆 ID 精确展开完整方案 | `{memory_get} <记忆ID或8位前缀>` |
 | 查询记忆与历史对话 | `{recall} "要查的内容"`（加 `--source-id <L0短ID>` 可直接展开对应 L0 原话及上下文） |
 | 记住一件事 | `{remember} "要记住的内容"` |
 | 列出当前记忆（含 `id`） | `{memory_list} "关键词"` |

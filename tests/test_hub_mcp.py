@@ -108,6 +108,24 @@ class StubCore:
             ],
         }
 
+    async def get_memory(self, memory_id: str) -> dict:
+        self.calls.append(("get_memory", memory_id))
+        return {
+            "memory_id": "a1b2c3d4-0000-1111-2222-333344445555",
+            "content": "How to publish SQLite transactions safely\nUse BEGIN IMMEDIATE",
+            "layer": "L1_FACT",
+            "kind": "procedure",
+            "is_latest": True,
+            "source_ids": ["37c85fe9-1111-2222-3333-444455556666"],
+            "procedure": {
+                "task": "How to publish SQLite transactions safely",
+                "solution": "Use BEGIN IMMEDIATE",
+                "boundary_scope": "project",
+                "boundary_envs": "SQLite 3.45+",
+                "files": ["memhub/store.py"],
+            },
+        }
+
     async def list_memories(self) -> list[dict]:
         self.calls.append(("list_memories",))
         return self.rows
@@ -137,6 +155,7 @@ async def test_tools_cover_the_full_memory_lifecycle() -> None:
     tools = {t.name: t for t in await build_hub_mcp(client=StubCore()).list_tools()}
     assert set(tools) == {
         "memory_add",
+        "memory_get",
         "memory_search",
         "memory_list",
         "memory_update",
@@ -145,6 +164,7 @@ async def test_tools_cover_the_full_memory_lifecycle() -> None:
         "memory_status",
     }
     assert "pending" in tools["memory_add"].description
+    assert "procedure-index" in tools["memory_get"].description
     assert "memory_id" in tools["memory_update"].description
     assert "找不到匹配项" in tools["memory_list"].description
     assert "session_id" in tools["conversation_search"].description
@@ -170,6 +190,18 @@ async def test_search_returns_flat_rows_with_ids() -> None:
     assert body["ok"] is True
     assert body["memories"][0]["id"] == "m-current"
     assert body["memories"][0]["content"] == "用户住在北京"
+
+
+async def test_memory_get_expands_procedure_by_short_id() -> None:
+    core = StubCore()
+    server = build_hub_mcp(client=core)
+    body = _payload(await server.call_tool("memory_get", {"memory_id": "a1b2c3d4"}))
+    assert body["ok"] is True
+    mem = body["memory"]
+    assert mem["memory_id"].startswith("a1b2c3d4")
+    assert mem["procedure"]["solution"] == "Use BEGIN IMMEDIATE"
+    assert mem["source_id"] == "37c85fe9"
+    assert core.calls == [("get_memory", "a1b2c3d4")]
 
 
 async def test_list_only_returns_editable_current_rows() -> None:
@@ -247,7 +279,7 @@ async def test_hub_client_memory_endpoints() -> None:
 
     def reply(request: httpx.Request) -> httpx.Response:
         seen.append((request.method, str(request.url), request.content.decode()))
-        if request.method == "GET":
+        if request.method == "GET" and str(request.url).endswith("/v1/hub/memories"):
             return httpx.Response(200, json={"memories": [{"id": "m1"}]})
         return httpx.Response(200, json={"memory_id": "m1", "success": True})
 
@@ -257,13 +289,15 @@ async def test_hub_client_memory_endpoints() -> None:
         transport=httpx.MockTransport(reply),
     ) as client:
         assert await client.list_memories() == [{"id": "m1"}]
+        assert (await client.get_memory("a1b2c3d4"))["memory_id"] == "m1"
         await client.update_memory("a/b", "新内容")
         await client.delete_memory("a/b")
     assert seen[0][1] == "http://hub/v1/hub/memories"
-    assert seen[1][0] == "PUT"
-    assert seen[1][1] == "http://hub/v1/hub/memories/a%2Fb"
-    assert json.loads(seen[1][2]) == {"content": "新内容"}
-    assert seen[2][:2] == ("DELETE", "http://hub/v1/hub/memories/a%2Fb")
+    assert seen[1][:2] == ("GET", "http://hub/v1/hub/memories/a1b2c3d4")
+    assert seen[2][0] == "PUT"
+    assert seen[2][1] == "http://hub/v1/hub/memories/a%2Fb"
+    assert json.loads(seen[2][2]) == {"content": "新内容"}
+    assert seen[3][:2] == ("DELETE", "http://hub/v1/hub/memories/a%2Fb")
 
 
 def test_installed_skill_lists_mcp_and_a_complete_cli_fallback() -> None:
@@ -285,12 +319,14 @@ def test_installed_skill_lists_mcp_and_a_complete_cli_fallback() -> None:
     assert "codex:<id>" in skill
     for needle in (
         "memory_add",
+        "memory_get",
         "memory_list",
         "memory_update",
         "memory_delete",
         "pending",
         "memhub recall --hub-dir /Users/xuming/.memhub",
         "memhub remember --hub-dir /Users/xuming/.memhub",
+        "memhub memory-get --hub-dir /Users/xuming/.memhub",
         "memhub memory-list --hub-dir /Users/xuming/.memhub",
         "memhub memory-update --hub-dir /Users/xuming/.memhub",
         "memhub memory-delete --hub-dir /Users/xuming/.memhub",
@@ -320,6 +356,10 @@ class FakeCliCore:
     async def delete_memory(self, memory_id: str) -> dict:
         self.calls.append(("delete_memory", memory_id))
         return {"success": True, "memory_id": memory_id}
+
+    async def get_memory(self, memory_id: str) -> dict:
+        self.calls.append(("get_memory", memory_id))
+        return await StubCore().get_memory(memory_id)
 
 
 def test_cli_memory_list_only_shows_editable_rows(monkeypatch) -> None:
@@ -386,3 +426,18 @@ def test_cli_memory_update_and_delete(monkeypatch) -> None:
         ("update_memory", "m-current", "用户鼓励用浏览器验证前端"),
         ("delete_memory", "m-current"),
     ]
+
+
+def test_cli_memory_get_formats_procedure_and_json(monkeypatch) -> None:
+    core = FakeCliCore()
+    monkeypatch.setattr(cli_hub, "make_client", lambda _hub: core)
+    human = cli_runner.invoke(cli_main.app, ["memory-get", "a1b2c3d4"])
+    assert human.exit_code == 0, human.output
+    assert "How to publish SQLite transactions safely" in human.output
+    assert "Use BEGIN IMMEDIATE" in human.output
+    assert "SQLite 3.45+" in human.output
+    assert "Source: L0 37c85fe9" in human.output
+
+    as_json = cli_runner.invoke(cli_main.app, ["memory-get", "a1b2c3d4", "--json"])
+    assert as_json.exit_code == 0, as_json.output
+    assert json.loads(as_json.output)["procedure"]["files"] == ["memhub/store.py"]

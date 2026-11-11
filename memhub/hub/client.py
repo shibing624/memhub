@@ -71,24 +71,24 @@ class HubClient:
         wait: bool = False,
         workspace_id: str | None = None,
         branch: str | None = None,
+        tool_signals: list[dict] | None = None,
     ) -> dict[str, Any]:
         """Submit evidence. Returns once it is durable in the Core (a receipt with
         status ``pending``); ``wait=True`` instead blocks until it is processed."""
-        return await self._request(
-            "POST",
-            "/v1/hub/writes",
-            json={
-                "content": content,
-                "messages": messages,
-                "session_id": session_id,
-                "memory_at": memory_at,
-                "request_id": request_id,
-                "raw_only": raw_only,
-                "wait": wait,
-                "workspace_id": workspace_id,
-                "branch": branch,
-            },
-        )
+        body: dict[str, Any] = {
+            "content": content,
+            "messages": messages,
+            "session_id": session_id,
+            "memory_at": memory_at,
+            "request_id": request_id,
+            "raw_only": raw_only,
+            "wait": wait,
+            "workspace_id": workspace_id,
+            "branch": branch,
+        }
+        if tool_signals is not None:
+            body["tool_signals"] = tool_signals
+        return await self._request("POST", "/v1/hub/writes", json=body)
 
     async def write_status(self, request_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/v1/hub/writes/{request_id}")
@@ -99,6 +99,11 @@ class HubClient:
 
     async def retry_failed(self) -> dict[str, Any]:
         return await self._request("POST", "/v1/hub/retry")
+
+    async def get_memory(self, memory_id: str) -> dict[str, Any]:
+        """Fetch one Hub memory by full ID or unique >=8-char prefix (for expanding index entries)."""
+        path = f"/v1/hub/memories/{quote(memory_id.strip(), safe='')}"
+        return await self._request("GET", path)
 
     async def recall(
         self,

@@ -24,6 +24,7 @@ from typing import Any
 
 from memhub.coding.preproc import (
     coding_dialogue,
+    extract_tool_signals,
     has_any_tool_message,
 )
 from memhub.coding.types import PROCEDURE_KIND, revised_procedure
@@ -249,6 +250,7 @@ class MemoryClient:
         workspace_id: str | None = None,
         branch: str | None = None,
         workspace_remote: str | None = None,
+        tool_signals: list[dict] | None = None,
     ) -> WriteResult:
         """Write one memory and run the cognition pipeline (Extract -> commit -> ...).
 
@@ -282,23 +284,25 @@ class MemoryClient:
         resolved_app_id = self._resolve_app_id(app_id)
 
         trajectory: list[dict] | None = None
-        if messages and self.procedures is not None:
-            turns = [
+        raw_turns: list[dict] | None = None
+        if messages:
+            raw_turns = [
                 dict(m) if isinstance(m, dict) else {"role": m.role, "content": m.content}
                 for m in messages
             ]
-            turns = [m for m in turns if m.get("role") != "system"]
-            if has_any_tool_message(turns):
-                # Only text is scrubbed; structured parts stay intact.
-                for turn in turns:
-                    if isinstance(turn.get("content"), str):
-                        turn["content"] = strip_memory_injection(turn["content"])
-                trajectory = turns
-                # A coding session is remembered by its dialogue: what the user
-                # asked and the answers they read. That is what L0_RAW keeps and
-                # what both extractors see; the tool trajectory only tells the
-                # procedure writer which files were touched.
-                messages = coding_dialogue(turns)
+            raw_turns = [m for m in raw_turns if m.get("role") != "system"]
+        if raw_turns and self.procedures is not None and has_any_tool_message(raw_turns):
+            # Only text is scrubbed; structured parts stay intact.
+            for turn in raw_turns:
+                if isinstance(turn.get("content"), str):
+                    turn["content"] = strip_memory_injection(turn["content"])
+            trajectory = raw_turns
+            # A coding session is remembered by its dialogue: what the user
+            # asked and the answers they read. That is what L0_RAW keeps and
+            # what both extractors see; the tool trajectory contributes touched
+            # files and compact objective execution signals.
+            messages = coding_dialogue(raw_turns)
+        signals = extract_tool_signals(raw_turns, extra=tool_signals) or None
 
         normalized: list[ChatMessage] | None = None
         user_turn_count = 0
@@ -341,6 +345,7 @@ class MemoryClient:
             "memory_at": memory_at,
             "workspace_id": workspace_id,
             "workspace_remote": workspace_remote,
+            "tool_signals": signals,
         }
         async with self._user_write_lock_ctx(resolved_app_id, user_id):
             result = await self.writer.write(**write_kwargs, messages=normalized)
@@ -393,6 +398,7 @@ class MemoryClient:
         request_id: str | None = None,
         workspace_id: str | None = None,
         workspace_remote: str | None = None,
+        tool_signals: list[dict] | None = None,
     ) -> WriteResult:
         """Write L0_RAW only (embed + store). Does not run extract.
 
@@ -401,6 +407,15 @@ class MemoryClient:
         request_id = request_id or str(uuid.uuid4())
         start = time.perf_counter()
         resolved_app_id = self._resolve_app_id(app_id)
+        raw_turns = (
+            [
+                dict(m) if isinstance(m, dict) else {"role": m.role, "content": m.content}
+                for m in messages
+            ]
+            if messages
+            else None
+        )
+        signals = extract_tool_signals(raw_turns, extra=tool_signals) or None
         text, _normalized, _turns = _prepare_write_text(
             content,
             messages,
@@ -428,6 +443,7 @@ class MemoryClient:
                 request_id=request_id,
                 workspace_id=workspace_id,
                 workspace_remote=workspace_remote,
+                tool_signals=signals,
             )
         return WriteResult(
             success=True,

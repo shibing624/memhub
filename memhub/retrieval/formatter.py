@@ -33,13 +33,82 @@ def format_memory_timestamp(ts: int | None) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
+def _item_source_id(item: dict) -> str:
+    direct = item.get("source_node_id")
+    if direct:
+        return str(direct)
+    for sid in item.get("source_ids") or []:
+        if sid:
+            return str(sid)
+    return ""
+
+
+def _procedure_boundary_tag(item: dict) -> str:
+    proc = item.get("procedure") if isinstance(item.get("procedure"), dict) else {}
+    parts: list[str] = []
+    scope = str(proc.get("boundary_scope") or "").strip()
+    if scope:
+        parts.append(f"scope={scope}")
+    branch = str(proc.get("branch") or "").strip()
+    if branch:
+        parts.append(f"branch={branch}")
+    envs = str(proc.get("boundary_envs") or "").strip()
+    if envs:
+        parts.append(f"env: {envs[:80]}")
+    files = [str(f) for f in (proc.get("files") or item.get("tags") or []) if f]
+    if files:
+        shown = ", ".join(files[:3])
+        if len(files) > 3:
+            shown += f" +{len(files) - 3}"
+        parts.append(f"files: {shown}")
+    return f" [{' | '.join(parts)}]" if parts else ""
+
+
+def _local_drift_line(item: dict) -> str:
+    drift = item.get("_local_drift")
+    if not isinstance(drift, dict):
+        return ""
+    missing = drift.get("missing_files") or []
+    if not missing:
+        return ""
+    branch = drift.get("branch")
+    branch_note = f", 当前分支 {branch}" if branch else ""
+    shown = ", ".join(str(p) for p in missing[:3])
+    if len(missing) > 3:
+        shown += f" 等 {len(missing)} 个文件"
+    return f"本机核验提示: 关联文件 {shown} 在当前工作区未找到{branch_note}，引用路径或命令前请核实当前代码"
+
+
+def _format_procedure_index(item: dict) -> str:
+    """Compact 1-line directory entry carrying stable memory ID, task, boundary, and L0 ref."""
+    proc = item.get("procedure") if isinstance(item.get("procedure"), dict) else {}
+    task = str(proc.get("task") or "").strip()
+    if not task:
+        first_line = str(item.get("content") or "").splitlines()
+        task = first_line[0].strip() if first_line else ""
+    mid = str(item.get("memory_id") or item.get("id") or "")
+    id_part = f" id={mid[:8]}" if mid else ""
+    boundary_part = _procedure_boundary_tag(item)
+    mem_date = format_memory_timestamp(item.get("memory_at") or item.get("gmt_created"))
+    date_part = f" (conversation date: {mem_date})" if mem_date else ""
+    source_id = _item_source_id(item)
+    source_part = f" (来源: L0 {source_id[:8]})" if source_id else ""
+    drift = _local_drift_line(item)
+    drift_part = f" ({drift})" if drift else ""
+    return f"- [procedure-index{id_part}] {task}{boundary_part}{date_part}{source_part}{drift_part}"
+
+
 def _format_item(
     item: dict,
     raw_truncate: int,
     *,
     include_superseded: bool = False,
+    compact_procedure: bool = False,
 ) -> str:
     """Format one memory item; evolution chains default to current head only."""
+    if item.get("kind") == "procedure" and compact_procedure:
+        return _format_procedure_index(item)
+
     content = item["content"]
     if item["category"] == "raw" and len(content) > raw_truncate:
         content = content[:raw_truncate] + "…"
@@ -47,7 +116,9 @@ def _format_item(
     mem_date = format_memory_timestamp(item.get("memory_at") or item.get("gmt_created"))
     date_suffix = f" (conversation date: {mem_date})" if mem_date else ""
     label = "procedure" if item.get("kind") == "procedure" else item["category"]
-    lines = [f"- [{label}] {_source_tag(item)}{content}{date_suffix}"]
+    mid = str(item.get("memory_id") or item.get("id") or "")
+    id_tag = f" id={mid[:8]}" if (label == "procedure" and mid and compact_procedure) else ""
+    lines = [f"- [{label}{id_tag}] {_source_tag(item)}{content}{date_suffix}"]
     if item.get("valid_from") is not None or item.get("valid_until") is not None:
         start = format_memory_timestamp(item.get("valid_from")) or "?"
         end = format_memory_timestamp(item.get("valid_until")) or "?"
@@ -59,9 +130,12 @@ def _format_item(
         end = format_memory_timestamp(max(int(x) for x in merged_ts))
         if start and end:
             lines.append(f"  (持续: {start} → {end})")
-    source_id = item.get("source_node_id") or ""
+    drift = _local_drift_line(item)
+    if drift:
+        lines.append(f"  ({drift})")
+    source_id = _item_source_id(item)
     if source_id:
-        lines.append(f"  (来源: L0 {str(source_id)[:8]})")
+        lines.append(f"  (来源: L0 {source_id[:8]})")
 
     chain = item.get("evolution_chain")
     is_merge = item.get("update_type") == "MERGE" or (
@@ -99,32 +173,177 @@ def relation_lines(item: dict, *, prefix: str = "  ") -> list[str]:
     return lines
 
 
+def covered_texts_by_source(
+    result: dict,
+    *,
+    procedure_full_score: float = 0.0,
+    max_full_procedures: int = -1,
+) -> dict[str, list[str]]:
+    """Map each L0_RAW node ID to the structured texts already expanded from it.
+
+    A procedure collapsed to a 1-line ``[procedure-index]`` only contributed its
+    ``task`` title, not its full ``solution``, so only its ``task`` counts as covered.
+    """
+    covered: dict[str, list[str]] = {}
+    for group in ("profile", "proactive", "normal"):
+        for item in result.get(group) or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("content") or "").strip()
+            if not text:
+                continue
+            sids = [item.get("source_node_id"), *(item.get("source_ids") or [])]
+            for sid in dict.fromkeys(str(s) for s in sids if s):
+                covered.setdefault(sid, []).append(text)
+    full_procs = 0
+    for item in result.get("procedures") or []:
+        if not isinstance(item, dict):
+            continue
+        score = float(item.get("score") or 0.0)
+        compact = False
+        if max_full_procedures == 0:
+            compact = True
+        elif procedure_full_score > 0.0:
+            over_cap = max_full_procedures > 0 and full_procs >= max_full_procedures
+            if score < procedure_full_score or over_cap:
+                compact = True
+            else:
+                full_procs += 1
+        proc = item.get("procedure") if isinstance(item.get("procedure"), dict) else {}
+        text = (
+            str(proc.get("task") or "").strip()
+            if compact
+            else str(item.get("content") or "").strip()
+        )
+        if not text:
+            continue
+        sids = [item.get("source_node_id"), *(item.get("source_ids") or [])]
+        for sid in dict.fromkeys(str(s) for s in sids if s):
+            covered.setdefault(sid, []).append(text)
+    return covered
+
+
+def format_project_view(
+    project_view: dict | None,
+    *,
+    exclude_ids: set[str] | None = None,
+    max_chars: int = 1200,
+) -> tuple[str, set[str]]:
+    """Render query-independent project conventions and procedure directory within budget."""
+    if not isinstance(project_view, dict) or max_chars <= 0:
+        return "", set()
+    excluded = set(exclude_ids or ())
+    rendered_ids: set[str] = set()
+    lines: list[str] = ["【项目约定与目录 Project View】"]
+    used = len(lines[0])
+    has_proc_index = False
+
+    for item in project_view.get("conventions") or []:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("memory_id") or item.get("id") or "")
+        if mid and mid in excluded:
+            continue
+        text = " ".join(str(item.get("content") or "").split())
+        if not text:
+            continue
+        source_id = _item_source_id(item)
+        src_part = f" (来源: L0 {source_id[:8]})" if source_id else ""
+        id_part = f" id={mid[:8]}" if mid else ""
+        line = f"- [rule{id_part}] {text}{src_part}"
+        if used + 1 + len(line) > max_chars:
+            break
+        lines.append(line)
+        used += 1 + len(line)
+        if mid:
+            rendered_ids.add(mid)
+            excluded.add(mid)
+
+    for item in project_view.get("procedures") or []:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("memory_id") or item.get("id") or "")
+        if mid and mid in excluded:
+            continue
+        line = _format_procedure_index(item)
+        if used + 1 + len(line) > max_chars:
+            break
+        lines.append(line)
+        used += 1 + len(line)
+        has_proc_index = True
+        if mid:
+            rendered_ids.add(mid)
+            excluded.add(mid)
+
+    if len(lines) == 1:
+        return "", set()
+    if has_proc_index:
+        hint = "  (按需展开: 看到相关 [procedure-index id=...] 可调 memory_get(memory_id=id) 读取完整方案)"
+        if used + 1 + len(hint) <= max_chars + 120:
+            lines.append(hint)
+    return "\n".join(lines), rendered_ids
+
+
 def format_memories(
     result: dict,
     raw_truncate: int = 800,
     *,
     include_superseded: bool = False,
     date_preamble: bool = True,
+    procedure_full_score: float = 0.0,
+    max_full_procedures: int = -1,
 ) -> str:
-    """Join non-empty profile/proactive/normal groups into a single context string."""
+    """Join non-empty profile/proactive/normal groups into a single context string.
+
+    ``max_full_procedures`` < 0 means unlimited; ``0`` renders every procedure as a
+    1-line ``[procedure-index id=...]`` entry; ``> 0`` caps full procedure expansions.
+    """
     blocks: list[str] = []
     has_dates = False
     seen_ids: set[str] = set()
+
     for key, title in _GROUP_TITLES:
         items = result.get(key) or []
         if not items:
             continue
         body_lines: list[str] = []
+        full_procs = 0
+        has_compact_proc = False
         for it in items:
             mid = it.get("memory_id") or it.get("id")
-            if mid and mid in seen_ids:
+            if mid and str(mid) in seen_ids:
                 continue
             if mid:
                 seen_ids.add(str(mid))
             if it.get("memory_at") or it.get("gmt_created"):
                 has_dates = True
+            compact_proc = False
+            if key == "procedures" and (procedure_full_score > 0.0 or max_full_procedures >= 0):
+                score = float(it.get("score") or 0.0)
+                if max_full_procedures == 0:
+                    compact_proc = True
+                elif max_full_procedures > 0 and full_procs >= max_full_procedures:
+                    compact_proc = True
+                elif procedure_full_score > 0.0 and score < procedure_full_score:
+                    compact_proc = True
+                if compact_proc:
+                    has_compact_proc = True
+                else:
+                    full_procs += 1
             body_lines.append(
-                _format_item(it, raw_truncate, include_superseded=include_superseded)
+                _format_item(
+                    it,
+                    raw_truncate,
+                    include_superseded=include_superseded,
+                    compact_procedure=compact_proc,
+                )
+            )
+        if not body_lines:
+            continue
+        if has_compact_proc:
+            body_lines.append(
+                "  (按需展开: 看到相关 [procedure-index id=...] 可调 "
+                "memory_get(memory_id=id) 读取完整方案，或按 L0 短 ID 调 conversation_search 核对原话)"
             )
         blocks.append(f"{title}\n" + "\n".join(body_lines))
 

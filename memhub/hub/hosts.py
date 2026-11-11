@@ -765,6 +765,7 @@ SKILL_TEMPLATE = Path(__file__).resolve().parent.parent / "skills" / SKILL_NAME 
 CLI_COMMANDS = (
     "recall",
     "remember",
+    "memory-get",
     "memory-list",
     "memory-update",
     "memory-delete",

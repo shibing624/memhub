@@ -26,7 +26,11 @@ from pydantic import ValidationError
 from memhub.hub import hosts as hub_hosts
 from memhub.hub import service as hub_service
 from memhub.hub import sync as hub_sync
-from memhub.hub.browse import canonical_workspace, current_rows
+from memhub.hub.browse import (
+    canonical_workspace,
+    current_rows,
+    inspect_local_procedure_files,
+)
 from memhub.hub.client import HubClient
 from memhub.hub.config import (
     CursorStore,
@@ -41,8 +45,12 @@ from memhub.hub.config import (
     save_sync_config,
 )
 from memhub.hub.sources import SOURCES, locate_transcript, scan_file, scan_sources
-from memhub.retrieval.formatter import format_memories
-from memhub.retrieval.hybrid_engine import source_excerpt
+from memhub.retrieval.formatter import (
+    covered_texts_by_source,
+    format_memories,
+    format_project_view,
+)
+from memhub.retrieval.hybrid_engine import novel_source_excerpt, source_excerpt
 
 hub_app = typer.Typer(help="MemHub：每台设备一个本地 Core，跨 CLI 共享个人记忆，可跨设备同步")
 HubDir = typer.Option(None, "--hub-dir", help="Hub 根目录（默认 ~/.memhub）")
@@ -56,6 +64,12 @@ PLAIN_CONTEXT_SOURCES = ("kimi-code", "kiro")
 HOOK_SOURCES = (*SOURCES, *INLINE_SOURCES)
 # Per recalled dialogue in the UserPromptSubmit injection.
 RAW_EXCERPT_CHARS = 1600
+SAME_SOURCE_EXCERPT_CHARS = 480
+# Default experimental thresholds when Core reply omits ``inject_policy``.
+PROCEDURE_FULL_SCORE = 0.40
+MAX_FULL_PROCEDURES = 2
+HUB_INJECT_MAX_CHARS = 3000
+HUB_INJECT_MAX_LINES = 120
 
 
 def make_client(hub_dir: str | None) -> HubClient:
@@ -570,6 +584,232 @@ def _other_host(source: str, payload: dict[str, Any]) -> bool:
     return source not in ("cursor", "trae") and "workspace_roots" in payload
 
 
+def _cap_block(text: str, max_chars: int, max_lines: int = 0) -> str:
+    out = text
+    truncated = False
+    if max_lines > 0:
+        lines = out.splitlines()
+        if len(lines) > max_lines:
+            out = "\n".join(lines[: max(max_lines - 1, 1)])
+            truncated = True
+    suffix = "\n(… 其余记忆已省略，可按需调用 memory_search / memory_get 深读)"
+    if max_chars > 0 and len(out) > max_chars:
+        limit = max(max_chars - len(suffix), 0)
+        cut = out.rfind("\n", 0, limit)
+        out = out[: cut if cut > 0 else limit].rstrip()
+        truncated = True
+    if truncated and not out.endswith(suffix):
+        if max_chars <= 0 or len(out) + len(suffix) <= max_chars:
+            out = f"{out}{suffix}"
+    return out
+
+
+def _with_local_drift(items: list[dict], workspace: str | None) -> list[dict]:
+    """Attach device-local file-presence hints without mutating caller/store dicts."""
+    if not items:
+        return []
+    out: list[dict] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        drift = inspect_local_procedure_files(it.get("procedure"), workspace)
+        out.append({**it, "_local_drift": drift} if drift else dict(it))
+    return out
+
+
+def build_hub_prompt_context(
+    result: dict[str, Any],
+    prompt: str,
+    *,
+    workspace: str | None = None,
+    raw_excerpt_chars: int = RAW_EXCERPT_CHARS,
+    same_source_excerpt_chars: int = SAME_SOURCE_EXCERPT_CHARS,
+    max_chars: int | None = None,
+    max_lines: int | None = None,
+    procedure_full_score: float | None = None,
+) -> str:
+    """Budgeted progressive-disclosure context: project view + dynamic recall + novel L0."""
+    policy = result.get("inject_policy") if isinstance(result.get("inject_policy"), dict) else {}
+    char_cap = HUB_INJECT_MAX_CHARS if max_chars is None else max_chars
+    if max_chars is None and isinstance(policy.get("max_chars"), int):
+        char_cap = policy["max_chars"]
+    line_cap = HUB_INJECT_MAX_LINES if max_lines is None else max_lines
+    if max_lines is None and isinstance(policy.get("max_lines"), int):
+        line_cap = policy["max_lines"]
+    proc_threshold = (
+        PROCEDURE_FULL_SCORE if procedure_full_score is None else procedure_full_score
+    )
+    if procedure_full_score is None and isinstance(
+        policy.get("procedure_full_score"), (int, float)
+    ):
+        proc_threshold = float(policy["procedure_full_score"])
+
+    raw_memories = result.get("memories") or {}
+    memories: dict[str, Any] = {
+        k: (
+            _with_local_drift(v, workspace)
+            if k == "procedures" and isinstance(v, list)
+            else list(v)
+            if isinstance(v, list)
+            else v
+        )
+        for k, v in raw_memories.items()
+    }
+    raw_view = result.get("project_view")
+    project_view: dict[str, Any] | None = None
+    if isinstance(raw_view, dict):
+        project_view = {
+            **raw_view,
+            "procedures": _with_local_drift(raw_view.get("procedures") or [], workspace),
+        }
+
+    dynamic_ids = {
+        str(it.get("memory_id") or it.get("id"))
+        for group in ("profile", "proactive", "normal", "procedures")
+        for it in (memories.get(group) or [])
+        if isinstance(it, dict) and (it.get("memory_id") or it.get("id"))
+    }
+    view_budget = int(char_cap * 0.40) if char_cap > 0 else 1200
+    view_block, view_ids = format_project_view(
+        project_view, exclude_ids=dynamic_ids, max_chars=max(view_budget, 240) if project_view else 0
+    )
+
+    # Fit curated memories by demoting full procedures to 1-line indices first, then
+    # dropping lowest-ranked trailing normal items before ever slicing mid-item.
+    working_memories = dict(memories)
+    chosen_full_procs = MAX_FULL_PROCEDURES
+    mem_block = ""
+    for full_cap in (MAX_FULL_PROCEDURES, 1, 0):
+        chosen_full_procs = full_cap
+        mem_block = format_memories(
+            working_memories,
+            procedure_full_score=proc_threshold,
+            max_full_procedures=full_cap,
+        ).strip()
+        combined = "\n\n".join(b for b in (view_block, mem_block) if b)
+        within_chars = char_cap <= 0 or len(combined) <= char_cap
+        within_lines = line_cap <= 0 or len(combined.splitlines()) <= line_cap
+        if within_chars and within_lines:
+            break
+
+    while working_memories.get("normal"):
+        combined = "\n\n".join(b for b in (view_block, mem_block) if b)
+        within_chars = char_cap <= 0 or len(combined) <= char_cap
+        within_lines = line_cap <= 0 or len(combined.splitlines()) <= line_cap
+        if within_chars and within_lines:
+            break
+        if len(working_memories["normal"]) <= 1:
+            break
+        working_memories = {
+            **working_memories,
+            "normal": working_memories["normal"][:-1],
+        }
+        mem_block = format_memories(
+            working_memories,
+            procedure_full_score=proc_threshold,
+            max_full_procedures=chosen_full_procs,
+        ).strip()
+
+    curated = "\n\n".join(b for b in (view_block, mem_block) if b).strip()
+    if (char_cap > 0 and len(curated) > char_cap) or (
+        line_cap > 0 and len(curated.splitlines()) > line_cap
+    ):
+        curated = _cap_block(curated, char_cap, line_cap)
+
+    covered = covered_texts_by_source(
+        working_memories,
+        procedure_full_score=proc_threshold,
+        max_full_procedures=chosen_full_procs,
+    )
+    if project_view and view_ids:
+        for item in project_view.get("conventions") or []:
+            mid = str(item.get("memory_id") or item.get("id") or "")
+            if mid in view_ids:
+                text = str(item.get("content") or "").strip()
+                sids = [item.get("source_node_id"), *(item.get("source_ids") or [])]
+                for sid in dict.fromkeys(str(s) for s in sids if s and text):
+                    covered.setdefault(sid, []).append(text)
+        for item in project_view.get("procedures") or []:
+            mid = str(item.get("memory_id") or item.get("id") or "")
+            if mid in view_ids:
+                proc = item.get("procedure") if isinstance(item.get("procedure"), dict) else {}
+                text = str(proc.get("task") or "").strip()
+                sids = [item.get("source_node_id"), *(item.get("source_ids") or [])]
+                for sid in dict.fromkeys(str(s) for s in sids if s and text):
+                    covered.setdefault(sid, []).append(text)
+
+    conversations = result.get("conversations") or []
+    if conversations:
+        turns = sorted(conversations, key=lambda item: item.get("memory_at") or 0)
+        header = "历史对话（从旧到新，同一件事以最新的为准）：\n"
+        rem_chars = (
+            char_cap - len(curated) - (2 if curated else 0) - len(header)
+            if char_cap > 0
+            else raw_excerpt_chars * len(turns)
+        )
+        rem_lines = (
+            line_cap - len(curated.splitlines()) - (2 if curated else 0)
+            if line_cap > 0
+            else 0
+        )
+        candidate_excerpts: list[str] = []
+        for item in turns:
+            if rem_chars <= 40:
+                break
+            raw_text = str(item.get("content") or "").strip()
+            if not raw_text:
+                continue
+            mid = str(item.get("memory_id") or "")
+            retired_claims = [
+                str(x) for x in (item.get("retired_claims") or []) if str(x).strip()
+            ]
+            active_covered = list(covered.get(mid) or [])
+            if active_covered or retired_claims:
+                snippet = novel_source_excerpt(
+                    raw_text,
+                    prompt,
+                    active_covered,
+                    min(same_source_excerpt_chars, max(rem_chars - 24, 0)),
+                    retired_texts=retired_claims,
+                )
+            else:
+                per_turn_cap = (
+                    min(raw_excerpt_chars, max(rem_chars - 24, 0))
+                    if char_cap > 0
+                    else raw_excerpt_chars
+                )
+                snippet = source_excerpt(raw_text, prompt, [], per_turn_cap)
+            if snippet.strip():
+                candidate_excerpts.append(f"- {_when(item)}{snippet.strip()}")
+
+        if candidate_excerpts:
+            if char_cap > 0 or line_cap > 0:
+                kept_indices: list[int] = []
+                used_chars = 0
+                used_lines = 0
+                for idx in range(len(candidate_excerpts) - 1, -1, -1):
+                    c_cost = len(candidate_excerpts[idx]) + (1 if kept_indices else 0)
+                    l_cost = len(candidate_excerpts[idx].splitlines())
+                    if char_cap > 0 and used_chars + c_cost > rem_chars:
+                        continue
+                    if line_cap > 0 and used_lines + l_cost > rem_lines:
+                        continue
+                    kept_indices.append(idx)
+                    used_chars += c_cost
+                    used_lines += l_cost
+                kept_indices.reverse()
+                candidate_excerpts = [candidate_excerpts[i] for i in kept_indices]
+            if candidate_excerpts:
+                raw = "\n".join(candidate_excerpts)
+                curated = f"{curated}\n\n{header}{raw}".strip()
+
+    warnings = result.get("warnings") or []
+    if warnings:
+        warning_block = "\n".join(str(w) for w in warnings)
+        curated = f"{curated}\n\n{warning_block}".strip()
+    return curated
+
+
 def _recall(payload: dict[str, Any], limit: int, hub_dir: str | None, source: str) -> None:
     """Answer the host's prompt event with the memories relevant to this prompt."""
     prompt = payload.get("prompt", "").strip()
@@ -586,27 +826,7 @@ def _recall(payload: dict[str, Any], limit: int, hub_dir: str | None, source: st
             )
 
     result = asyncio.run(search())
-    context = format_memories(result["memories"]).strip()
-    if result["conversations"]:
-        # Oldest first with a time on each, so a later turn reads as the correction
-        # of an earlier one instead of two equal claims.
-        # ``memory_at`` is omitted when a row has no time (written before arrival
-        # times were recorded), so it is optional here.
-        turns = sorted(result["conversations"], key=lambda item: item.get("memory_at") or 0)
-        # A whole session can run to tens of thousands of characters; only the
-        # passages that bear on the prompt go in.
-        raw = "\n".join(
-            f"- {_when(item)}"
-            f"{source_excerpt(item['content'].strip(), prompt, [], RAW_EXCERPT_CHARS)}"
-            for item in turns
-        )
-        context = (
-            f"{context}\n\n历史对话（从旧到新，同一件事以最新的为准）：\n{raw}"
-        ).strip()
-    warnings = result.get("warnings") or []
-    if warnings:
-        warning_block = "\n".join(str(w) for w in warnings)
-        context = f"{context}\n\n{warning_block}".strip()
+    context = build_hub_prompt_context(result, prompt, workspace=workspace)
     if context:
         # Tagged so strip_memory_injection drops it if a host echoes it back.
         context = f"<relevant-memories>\n{context}\n</relevant-memories>"
@@ -675,6 +895,7 @@ def hub_recall(
     ),
     limit: int = typer.Option(10, "--limit"),
     raw_limit: int = typer.Option(5, "--raw-limit"),
+    workspace: str = typer.Option("", "--workspace", "-w", help="限定项目路径并返回项目约定视图"),
     json_out: bool = typer.Option(False, "--json"),
     hub_dir: str | None = HubDir,
 ) -> None:
@@ -704,19 +925,23 @@ def hub_recall(
         typer.echo("\n\n".join(lines) or "没有找到对应的原始对话。")
         return
 
+    canon_ws = canonical_workspace(workspace) or None
+
     async def search() -> dict[str, Any]:
         async with make_client(hub_dir) as client:
-            return await client.recall(
-                query=query,
-                limit=limit,
-                raw_limit=raw_limit,
-            )
+            kw: dict[str, Any] = {"query": query, "limit": limit, "raw_limit": raw_limit}
+            if canon_ws is not None:
+                kw["workspace"] = canon_ws
+            return await client.recall(**kw)
 
     result = asyncio.run(search())
     if json_out:
         _echo(result)
         return
     sections = []
+    view_text, _ = format_project_view(result.get("project_view"))
+    if view_text:
+        sections.append(f"## 项目约定与目录\n{view_text}")
     memories = format_memories(result["memories"]).strip()
     if memories:
         sections.append(f"## 记忆\n{memories}")
@@ -729,6 +954,42 @@ def hub_recall(
             )
         )
     typer.echo("\n\n".join(sections) or "没有相关记忆。")
+
+
+@hub_app.command("memory-get")
+def hub_memory_get(
+    memory_id: str = typer.Argument(..., help="记忆完整 ID 或 >=8 位前缀（如 procedure-index 中的 id）"),
+    json_out: bool = typer.Option(False, "--json", help="输出完整 JSON"),
+    hub_dir: str | None = HubDir,
+) -> None:
+    """按记忆 ID 精确展开单条记忆的完整内容（含 procedure 完整方案、适用边界与来源）。"""
+
+    async def remote() -> dict[str, Any]:
+        async with make_client(hub_dir) as client:
+            return await client.get_memory(memory_id)
+
+    item = asyncio.run(remote())
+    if json_out:
+        _echo(item)
+        return
+    proc = item.get("procedure")
+    header = f"[{item.get('kind') or item.get('layer')}] id={item.get('memory_id')}"
+    if not item.get("is_latest", True):
+        header += " (历史旧版本)"
+    lines = [header]
+    if isinstance(proc, dict):
+        lines.append(f"Task: {proc.get('task', '')}")
+        lines.append(f"Solution:\n{proc.get('solution', '')}")
+        if proc.get("boundary_envs"):
+            lines.append(f"Boundary: {proc['boundary_envs']} (scope={proc.get('boundary_scope', 'project')})")
+        if proc.get("files"):
+            lines.append(f"Files: {', '.join(proc['files'])}")
+    else:
+        lines.append(str(item.get("content") or ""))
+    src = item.get("source_node_id") or next(iter(item.get("source_ids") or []), "")
+    if src:
+        lines.append(f"Source: L0 {str(src)[:8]} ({src})")
+    typer.echo("\n".join(lines))
 
 
 @hub_app.command("remember")

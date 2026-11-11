@@ -31,8 +31,10 @@ from memhub.hub.browse import (
     browse_rows,
     canonical_workspace,
     git_remote_slug,
+    matching_workspace_nodes,
     workspace_sessions,
 )
+from memhub.retrieval.reader import Reader
 from memhub.hub.config import (
     SyncConfig,
     format_time,
@@ -47,7 +49,7 @@ from memhub.hub.queue import HubWriteQueue, evidence_fingerprint
 from memhub.hub.redact import sanitize_messages, sanitize_text
 from memhub.hub.sync import HubSyncer, SyncBackend, project_received
 from memhub.sdk_models import SearchMemories
-from memhub.types import Layer, MemoryStatus
+from memhub.types import Layer, MemoryNode, MemoryStatus
 from memhub.isolation import build_filter
 
 HUB_USER_ID = "default"
@@ -63,6 +65,7 @@ class HubWriteRequest(BaseModel):
     # Version boundary of procedures from a tool trajectory.
     workspace_id: str | None = None
     branch: str | None = None
+    tool_signals: list[dict] | None = None
     # ``False`` returns as soon as the evidence is durable; the job runs later.
     wait: bool = False
 
@@ -169,12 +172,23 @@ def last_digest_due(root: Path, *, min_hours: float, now: float | None = None) -
     return current - last >= min_hours * 3600.0
 
 
-def project_sessions(client: MemoryClient, workspace: str) -> list[str]:
-    """Session ids of the dialogues written from ``workspace``, read from the store.
+def _is_active_head(node: MemoryNode, now: int) -> bool:
+    if not node.is_latest or (node.custom or {}).get("archived"):
+        return False
+    if node.valid_until is not None and node.valid_until < now:
+        return False
+    if node.valid_from is not None and node.valid_from > now:
+        return False
+    return True
 
-    The store replicates, so dialogues written from the same project on another
-    device scope recall here too. Procedures carry the workspace as well, which
-    covers dialogues stored before the evidence kept it.
+
+def project_sessions_and_view(
+    client: MemoryClient, workspace: str
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Session ids of ``workspace``, plus a query-independent live project view.
+
+    Built directly from current (``is_latest``) store versions so updates, negations,
+    and deletions take effect immediately without waiting for an offline digest.
     """
     vector = client.factory.vector
     scope = {
@@ -183,10 +197,64 @@ def project_sessions(client: MemoryClient, workspace: str) -> list[str]:
         "agent_ids": [""],
         "statuses": [MemoryStatus.ACTIVE],
     }
-    nodes = vector.get_many(
-        build_filter(**scope, layers=[Layer.L0_RAW]), None
-    ) + vector.get_many(build_filter(**scope, kinds=[PROCEDURE_KIND]), None)
-    return workspace_sessions(nodes, workspace)
+    raw_nodes = vector.get_many(build_filter(**scope, layers=[Layer.L0_RAW]), None)
+    proc_nodes = vector.get_many(build_filter(**scope, kinds=[PROCEDURE_KIND]), None)
+    sessions = workspace_sessions([*raw_nodes, *proc_nodes], workspace)
+    session_set = set(sessions)
+    now = int(time.time())
+
+    live_procs = [
+        n
+        for n in matching_workspace_nodes(proc_nodes, workspace, session_ids=session_set)
+        if _is_active_head(n, now)
+    ]
+    live_procs.sort(
+        key=lambda n: (n.memory_at or n.gmt_created or 0, n.node_id), reverse=True
+    )
+
+    conventions: list[MemoryNode] = []
+    if sessions:
+        project_facts = vector.get_many(
+            build_filter(
+                **scope,
+                layers=[Layer.L1_FACT, Layer.L2_PROFILE],
+                session_ids=sessions,
+                latest_only=True,
+                exclude_kinds=[PROCEDURE_KIND],
+            ),
+            None,
+        )
+        conventions = [
+            n
+            for n in project_facts
+            if _is_active_head(n, now)
+            and n.owner not in ("agent", "assistant")
+            and not (n.custom or {}).get("negation")
+        ]
+        # Explicit profile/rules first, then newest user-confirmed project facts/decisions.
+        conventions.sort(
+            key=lambda n: (
+                1 if n.layer == Layer.L2_PROFILE else 0,
+                n.memory_at or n.gmt_created or 0,
+                n.node_id,
+            ),
+            reverse=True,
+        )
+
+    if not conventions and not live_procs:
+        return sessions, None
+    view = {
+        "workspace": canonical_workspace(workspace),
+        "conventions": [Reader.memory_node_to_item(n).to_dict() for n in conventions[:12]],
+        "procedures": [Reader.memory_node_to_item(n).to_dict() for n in live_procs[:20]],
+    }
+    return sessions, view
+
+
+def project_sessions(client: MemoryClient, workspace: str) -> list[str]:
+    """Session ids of the dialogues written from ``workspace``, read from the store."""
+    sessions, _ = project_sessions_and_view(client, workspace)
+    return sessions
 
 
 def create_hub_app(
@@ -277,11 +345,13 @@ def create_hub_app(
                 # Rows queued before boundaries existed carry none.
                 workspace_id = payload.get("workspace_id")
                 workspace_remote = payload.get("workspace_remote")
+                tool_signals = payload.get("tool_signals")
                 if payload["raw_only"]:
                     result = await core_client.add_raw(
                         **kwargs,
                         workspace_id=workspace_id,
                         workspace_remote=workspace_remote,
+                        tool_signals=tool_signals,
                     )
                 else:
                     result = await core_client.add(
@@ -289,6 +359,7 @@ def create_hub_app(
                         workspace_id=workspace_id,
                         branch=payload.get("branch"),
                         workspace_remote=workspace_remote,
+                        tool_signals=tool_signals,
                     )
                 if syncer is not None:
                     syncer.kick()
@@ -395,6 +466,19 @@ def create_hub_app(
             # ``.git`` are blocking work; keep them off the Core's event loop.
             payload["content"] = sanitize_text(payload["content"], redact=redact)
             payload["messages"] = sanitize_messages(payload["messages"], redact=redact)
+            if isinstance(payload.get("tool_signals"), list):
+                cleaned_signals = []
+                for sig in payload["tool_signals"]:
+                    if not isinstance(sig, dict):
+                        continue
+                    item = dict(sig)
+                    for field_name in ("target", "error"):
+                        if isinstance(item.get(field_name), str):
+                            item[field_name] = sanitize_text(
+                                item[field_name], redact=redact
+                            )
+                    cleaned_signals.append(item)
+                payload["tool_signals"] = cleaned_signals or None
             if payload.get("workspace_id"):
                 payload["workspace_remote"] = git_remote_slug(payload["workspace_id"])
                 payload["workspace_id"] = (
@@ -556,11 +640,12 @@ def create_hub_app(
             app.state.syncer.pull_if_stale()
         memories = SearchMemories()
         conversations = SearchMemories()
-        sessions = (
-            await asyncio.to_thread(project_sessions, core_client, body.workspace)
-            if body.workspace
-            else []
-        )
+        sessions: list[str] = []
+        project_view: dict[str, Any] | None = None
+        if body.workspace:
+            sessions, project_view = await asyncio.to_thread(
+                project_sessions_and_view, core_client, body.workspace
+            )
         scope = sessions or None
         if body.limit > 0 or body.procedure_limit > 0:
             memories = (
@@ -570,6 +655,7 @@ def create_hub_app(
                     agent_ids=[""],
                     limit=body.limit,
                     procedure_limit=body.procedure_limit,
+                    procedure_min_score=HUB_RECALL_MIN_SCORE,
                     profile_limit=0 if scope else HUB_RECALL_PROFILE_LIMIT,
                     min_score=HUB_RECALL_MIN_SCORE,
                     profile_min_score=HUB_RECALL_MIN_SCORE,
@@ -616,10 +702,49 @@ def create_hub_app(
                     session_ids=scope,
                 )
             ).memories
+        conv_dicts = [item.to_dict() for item in conversations.normal]
+        if conv_dicts:
+            raw_ids = {c["memory_id"] for c in conv_dicts if c.get("memory_id")}
+            if raw_ids:
+                all_curated = await asyncio.to_thread(
+                    core_client.factory.vector.get_many,
+                    build_filter(
+                        app_ids=[core_client.settings.default_app_id],
+                        user_id=HUB_USER_ID,
+                        agent_ids=[""],
+                        statuses=[MemoryStatus.ACTIVE],
+                        layers=[Layer.L1_FACT, Layer.L2_PROFILE],
+                    ),
+                    None,
+                )
+                retired_by_raw: dict[str, list[str]] = {}
+                for n in all_curated:
+                    custom = n.custom or {}
+                    if n.is_latest and not custom.get("archived") and not custom.get("negation"):
+                        continue
+                    refs = {
+                        str(s)
+                        for s in [custom.get("source_node_id"), *(custom.get("source_ids") or [])]
+                        if s
+                    }
+                    for rid in refs & raw_ids:
+                        retired_by_raw.setdefault(rid, []).append(n.content)
+                for c in conv_dicts:
+                    claims = retired_by_raw.get(c.get("memory_id", ""))
+                    if claims:
+                        c["retired_claims"] = claims
+
         out: dict[str, Any] = {
             "memories": memories.to_dict(),
-            "conversations": [item.to_dict() for item in conversations.normal],
+            "conversations": conv_dicts,
+            "inject_policy": {
+                "max_chars": core_client.settings.hub_inject_max_chars,
+                "max_lines": core_client.settings.hub_inject_max_lines,
+                "procedure_full_score": core_client.settings.hub_procedure_full_score,
+            },
         }
+        if project_view is not None:
+            out["project_view"] = project_view
         warnings = health_warnings()
         if warnings:
             out["warnings"] = warnings
@@ -659,6 +784,54 @@ def create_hub_app(
         if app.state.syncer is not None:
             app.state.syncer.kick()
         return result.to_dict()
+
+    @app.get("/v1/hub/memories/{memory_id}", dependencies=[Depends(verify)])
+    async def get_memory(memory_id: str):
+        """Fetch one memory by full ID or unique >=8-char prefix (progressive disclosure)."""
+        needle = memory_id.strip()
+        if not needle:
+            raise HTTPException(status_code=400, detail="memory_id cannot be empty")
+        core_client: MemoryClient = app.state.client
+        vector = core_client.factory.vector
+
+        node = await asyncio.to_thread(vector.get, needle)
+        if node is not None and (
+            node.layer == Layer.L0_RAW
+            or node.app_id != core_client.settings.default_app_id
+            or node.user_id != HUB_USER_ID
+        ):
+            node = None
+        if node is None:
+            ids = await asyncio.to_thread(
+                vector.get_ids,
+                build_filter(
+                    app_ids=[core_client.settings.default_app_id],
+                    user_id=HUB_USER_ID,
+                    agent_ids=[""],
+                    statuses=[MemoryStatus.ACTIVE],
+                    layers=[Layer.L1_FACT, Layer.L2_PROFILE, Layer.L3_DERIVED],
+                ),
+            )
+            hits = [i for i in ids if len(needle) >= 8 and i.startswith(needle)]
+            if len(hits) > 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"memory id prefix {needle!r} matches {len(hits)} items; pass more characters",
+                )
+            if not hits:
+                raise HTTPException(
+                    status_code=404, detail=f"memory {needle!r} not found"
+                )
+            node = await asyncio.to_thread(vector.get, hits[0])
+            if node is None:
+                raise HTTPException(
+                    status_code=404, detail=f"memory {needle!r} not found"
+                )
+
+        item = Reader.memory_node_to_item(node).to_dict()
+        if (node.custom or {}).get("archived"):
+            item["archived"] = True
+        return item
 
     @app.put("/v1/hub/memories/{memory_id}", dependencies=[Depends(verify)])
     async def edit_memory(memory_id: str, body: HubMemoryEdit):
