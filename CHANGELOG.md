@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **修复 DeepSeek Harness（`dsh`）MCP 插件名与 `cordis.patch.yml` 插入语法错误导致工具不加载的问题**：
+  - 此前 `DshMcp` 写入的是不存在的 `@deepseek-ai/dsh-mcp-manager`（嵌套 `config.servers.memhub`），导致 DeepSeek Harness Desktop/CLI 启动时忽略该条目、会话中不出现任何 `mcp__memhub__*` 工具。
+  - 现改为使用官方内置的 `@deepseek-ai/dsh-mcp-client`（平铺 `serverName: memhub`、`transport: stdio`、`command`、`args`），并按 Cordis Loader 补丁方言包裹在顶层 `- insert: [ - id: mcp-memhub ... ]` 中（在 `cordis.patch.yml` 中若直接写顶层 `- id: mcp-memhub` 而不带 `insert:`，会被当作对已有条目的覆盖因目标不存在而被跳过）。重跑 `memhub install-host dsh` 会自动清理旧的 `mcp-manager` 条目并原地迁移。
 - **渐进式记忆披露闭环、实时项目约定视图与全入口执行证据留存**：
   - **抽取职责与噪音收敛**：`CodingMemoryExtractor` 提示词明确区分可复用的工程隐性规则/根因/决策（latent rules）与读当前代码即可获知的临时会话状态（ephemeral state）；`Extractor.extract_system1` 排除助手单次操作过程播报（如“助手修改/运行/确认了…”），同时在含工具调用的混合会话与无工具架构讨论会话中继续保留具体的助手事实（地址、命令、参数、技术依据）与用户事实，不按“是否含工具调用”一刀切丢弃 `owner="agent"`。
   - **按 ID 精确展开记忆（`memory_get`）与有预算的渐进披露**：Core 新增 `GET /v1/hub/memories/{memory_id}`（`HubClient.get_memory`），支持完整 ID 或唯一 `>=8` 位短前缀精确读取单条记忆及其完整 `procedure` 结构；Hub MCP 新增 `memory_get(memory_id)` 工具，CLI 新增 `memhub memory-get <id>`，并同步更新 `memhub-recall` skill（已安装宿主可重跑 `memhub install-host`）。`Settings` 新增实验参数 `hub_inject_max_chars`（默认 `3000`）、`hub_inject_max_lines`（默认 `120`）与 `hub_procedure_full_score`（默认 `0.40`）：未达完整展开阈值或超出预算的 `procedure` 自动降级为带 `id`、任务标题、适用边界（`scope`/`branch`/`env`/`files`）与 `L0` 来源的单行 `[procedure-index id=...]` 目录项，避免截断命令或否定约束。

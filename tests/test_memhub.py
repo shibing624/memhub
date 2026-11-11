@@ -1148,13 +1148,19 @@ def test_install_uninstall_hosts_use_local_proxy(tmp_path: Path, monkeypatch) ->
         assert "memhub" in json.loads((home / buddy / "mcp.json").read_text())["mcpServers"]
         buddy_hooks = json.loads((home / buddy / "settings.json").read_text())["hooks"]
         assert set(buddy_hooks) >= {"UserPromptSubmit", "Stop"}
-    # dsh: our server joins the profile's patch; the user's entry and comment stay.
+    # dsh: our server joins the profile's patch via `- insert:`; the user's entry and comment stay.
     dsh_patch = patch.read_text()
     assert dsh_patch.startswith("# Your patch layer for this dsh profile.\n")
-    entries = {item["id"]: item for item in yaml.safe_load(dsh_patch)}
+    dsh_items = yaml.safe_load(dsh_patch)
+    entries = {item["id"]: item for item in dsh_items if "id" in item}
     assert entries["ui-chat"]["config"] == {"transcriptView": "standard", "purpose": None}
     assert dsh_patch.startswith(dsh_before)  # the user's own text is byte-identical
-    server = entries["mcp-manager"]["config"]["servers"]["memhub"]
+    inserted = [row for item in dsh_items if "insert" in item for row in item["insert"]]
+    assert len(inserted) == 1
+    assert inserted[0]["id"] == "mcp-memhub"
+    assert inserted[0]["name"] == "@deepseek-ai/dsh-mcp-client"
+    server = inserted[0]["config"]
+    assert server["serverName"] == "memhub"
     assert server["transport"] == "stdio" and server["args"][:2] == ["-m", "memhub.hub.mcp"]
     # kimi: one marked block at the end; the user's own hook and settings are untouched.
     kimi_text = (home / ".kimi" / "config.toml").read_text()
@@ -3573,5 +3579,71 @@ async def test_failed_writes_auto_recover_on_later_success_and_restart_without_p
     assert (await restarted.wait("r-poison"))["status"] == "done"
     assert restarted.failure_summary() == (0, None)
     await restarted.close()
+
+
+def test_dsh_mcp_migrates_legacy_manager_and_bare_entry_to_insert_row(
+    tmp_path: Path,
+) -> None:
+    """DeepSeek Harness requires ``- insert: [ {id: mcp-memhub, name: @deepseek-ai/dsh-mcp-client, ...} ]``.
+    Legacy ``mcp-manager`` entries and bare non-insert ``mcp-memhub`` entries are upgraded cleanly,
+    while coexisting ``insert`` entries for other MCP servers remain untouched."""
+    home = tmp_path / "home"
+    hub = tmp_path / "hub"
+    patch = home / ".dsh" / "profiles" / "desktop" / "cordis.patch.yml"
+    patch.parent.mkdir(parents=True)
+    patch.write_text(
+        "# User profile patch\n"
+        "- id: ui-theme\n"
+        '  name: "@deepseek-ai/dsh-client-ui-theme"\n'
+        "  config:\n"
+        "    preference: dark\n"
+        "- insert:\n"
+        "  - id: mcp-github\n"
+        "    name: '@deepseek-ai/dsh-mcp-client'\n"
+        "    config:\n"
+        "      serverName: github\n"
+        "      transport: stdio\n"
+        "      command: npx\n"
+        "- id: mcp-manager\n"
+        "  name: '@deepseek-ai/dsh-mcp-manager'\n"
+        "  config:\n"
+        "    servers:\n"
+        "      memhub:\n"
+        "        transport: stdio\n"
+        "        command: /old/python\n"
+        "- id: mcp-memhub\n"
+        "  name: '@deepseek-ai/dsh-mcp-client'\n"
+        "  config:\n"
+        "    serverName: memhub\n"
+        "    transport: stdio\n"
+        "    command: /bare/python\n",
+        encoding="utf-8",
+    )
+
+    # Legacy/bare shapes are NOT counted as validly installed before migration.
+    assert hosts_status(home=home)["dsh"]["mcp"] is False
+
+    install_host("dsh", hub_dir=hub, home=home)
+    install_host("dsh", hub_dir=hub, home=home)  # idempotent
+    assert hosts_status(home=home)["dsh"]["mcp"] is True
+
+    parsed = yaml.safe_load(patch.read_text(encoding="utf-8"))
+    top_ids = [item.get("id") for item in parsed if "id" in item]
+    assert top_ids == ["ui-theme"]
+    inserted = [row for item in parsed if "insert" in item for row in item["insert"]]
+    assert [row["id"] for row in inserted] == ["mcp-github", "mcp-memhub"]
+    memhub_row = inserted[1]
+    assert memhub_row["name"] == "@deepseek-ai/dsh-mcp-client"
+    assert memhub_row["config"]["serverName"] == "memhub"
+    assert memhub_row["config"]["transport"] == "stdio"
+    assert memhub_row["config"]["args"] == ["-m", "memhub.hub.mcp", "--hub-dir", str(hub.resolve())]
+
+    assert uninstall_host("dsh", home=home)["mcp"] is True
+    assert hosts_status(home=home)["dsh"]["mcp"] is False
+    after = yaml.safe_load(patch.read_text(encoding="utf-8"))
+    assert [row["id"] for item in after if "insert" in item for row in item["insert"]] == [
+        "mcp-github"
+    ]
+
 
 

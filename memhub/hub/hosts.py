@@ -565,15 +565,20 @@ def _patch_yaml() -> YAML:
 
 
 class DshMcp:
-    """DeepSeek Harness (app and CLI): ``mcp-manager`` servers in each profile's
-    ``cordis.patch.yml`` (``~/.dsh/profiles/<name>/``).
+    """DeepSeek Harness (app and CLI): insert an ``@deepseek-ai/dsh-mcp-client``
+    row into each profile's ``cordis.patch.yml`` (``~/.dsh/profiles/<name>/``).
 
-    A profile is created by dsh itself on first boot, with a ``package.json`` the
-    patch depends on, so only profiles that already exist are edited.
+    ``cordis.patch.yml`` is a Cordis Loader patch list: top-level items without
+    ``insert`` are id-targeted overrides of already-mounted bundle rows and are
+    skipped with a warning when the id does not exist, so a new MCP client row
+    must be wrapped in ``- insert: [...]`` (matching DSH's own ``templates/mcp/``).
+    A profile is created by dsh itself on first boot, so only profiles that
+    already exist are edited.
     """
 
-    ENTRY_ID = "mcp-manager"
-    ENTRY_NAME = "@deepseek-ai/dsh-mcp-manager"
+    ENTRY_ID = f"mcp-{MCP_NAME}"
+    ENTRY_NAME = "@deepseek-ai/dsh-mcp-client"
+    LEGACY_ID = "mcp-manager"
 
     @staticmethod
     def _patches(root: Path) -> list[Path]:
@@ -589,26 +594,38 @@ class DshMcp:
         _patch_yaml().dump(data, buf)
         _write(path, buf.getvalue())
 
-    def install(self, path: Path, launch: Launch) -> None:
-        mcp = launch.mcp()
-        server = {"transport": "stdio", "command": mcp["command"], "args": mcp["args"]}
-        for patch in self._patches(path):
-            data = self._load(patch)
-            entry = next((e for e in data if e.get("id") == self.ENTRY_ID), None)
-            if entry is None:
-                entry = {"id": self.ENTRY_ID, "name": self.ENTRY_NAME}
-                data.append(entry)
-            entry.setdefault("config", {}).setdefault("servers", {})[MCP_NAME] = server
-            self._dump(patch, data)
+    @classmethod
+    def _is_ours(cls, row: Any) -> bool:
+        if not isinstance(row, dict):
+            return False
+        if row.get("id") == cls.ENTRY_ID:
+            return True
+        return (
+            row.get("name") == cls.ENTRY_NAME
+            and (row.get("config") or {}).get("serverName") == MCP_NAME
+        )
 
-    def uninstall(self, path: Path) -> bool:
+    @staticmethod
+    def _is_root_insert(item: Any) -> bool:
+        return (
+            isinstance(item, dict)
+            and not item.get("id")
+            and isinstance(item.get("insert"), list)
+        )
+
+    @classmethod
+    def _clean_legacy(cls, data: list) -> bool:
+        """Strip obsolete ``mcp-manager`` or bare non-insert ``mcp-memhub`` items."""
         changed = False
-        for patch in self._patches(path):
-            data = self._load(patch)
-            for entry in list(data):
-                servers = (entry.get("config") or {}).get("servers") or {}
-                if entry.get("id") != self.ENTRY_ID or MCP_NAME not in servers:
-                    continue
+        for entry in list(data):
+            if not isinstance(entry, dict) or "insert" in entry:
+                continue
+            if cls._is_ours(entry):
+                data.remove(entry)
+                changed = True
+                continue
+            servers = (entry.get("config") or {}).get("servers") or {}
+            if entry.get("id") == cls.LEGACY_ID and MCP_NAME in servers:
                 del servers[MCP_NAME]
                 if not servers:
                     del entry["config"]["servers"]
@@ -617,20 +634,74 @@ class DshMcp:
                 if set(entry) <= {"id", "name"}:
                     data.remove(entry)
                 changed = True
+        return changed
+
+    def install(self, path: Path, launch: Launch) -> None:
+        mcp = launch.mcp()
+        row = {
+            "id": self.ENTRY_ID,
+            "name": self.ENTRY_NAME,
+            "config": {
+                "serverName": MCP_NAME,
+                "transport": "stdio",
+                "command": mcp["command"],
+                "args": mcp["args"],
+            },
+        }
+        for patch in self._patches(path):
+            data = self._load(patch)
+            self._clean_legacy(data)
+            placed = False
+            for item in list(data):
+                if not self._is_root_insert(item):
+                    continue
+                rows = item["insert"]
+                for idx in range(len(rows) - 1, -1, -1):
+                    if not self._is_ours(rows[idx]):
+                        continue
+                    if not placed:
+                        rows[idx] = row
+                        placed = True
+                    else:
+                        del rows[idx]
+                if not rows and set(item) <= {"insert"}:
+                    data.remove(item)
+            if not placed:
+                data.append({"insert": [row]})
             self._dump(patch, data)
+
+    def uninstall(self, path: Path) -> bool:
+        changed = False
+        for patch in self._patches(path):
+            data = self._load(patch)
+            file_changed = self._clean_legacy(data)
+            for item in list(data):
+                if not self._is_root_insert(item):
+                    continue
+                rows = item["insert"]
+                kept = [r for r in rows if not self._is_ours(r)]
+                if len(kept) == len(rows):
+                    continue
+                file_changed = True
+                if kept or (set(item) - {"insert"}):
+                    rows[:] = kept
+                else:
+                    data.remove(item)
+            if file_changed:
+                self._dump(patch, data)
+                changed = True
         return changed
 
     def installed(self, path: Path) -> bool:
         patches = self._patches(path)
         return bool(patches) and all(
-            MCP_NAME
-            in next(
-                (
-                    (e.get("config") or {}).get("servers") or {}
-                    for e in self._load(patch)
-                    if e.get("id") == self.ENTRY_ID
-                ),
-                {},
+            any(
+                self._is_ours(row)
+                and row.get("name") == self.ENTRY_NAME
+                and (row.get("config") or {}).get("serverName") == MCP_NAME
+                for item in self._load(patch)
+                if self._is_root_insert(item)
+                for row in item["insert"]
             )
             for patch in patches
         )
