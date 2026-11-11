@@ -32,6 +32,8 @@ from memhub.hub.browse import (
     canonical_workspace,
     git_remote_slug,
     matching_workspace_nodes,
+    node_matches_workspace,
+    source_boundaries,
     workspace_sessions,
 )
 from memhub.retrieval.reader import Reader
@@ -53,6 +55,10 @@ from memhub.types import Layer, MemoryNode, MemoryStatus
 from memhub.isolation import build_filter
 
 HUB_USER_ID = "default"
+# Project view keeps L1 rules from being crowded out by cross-cutting profiles.
+_PROJECT_CONVENTION_LIMIT = 12
+_PROJECT_PROFILE_QUOTA = 4
+_HUB_READ_LAYERS = (Layer.L1_FACT, Layer.L2_PROFILE, Layer.L3_DERIVED)
 
 
 class HubWriteRequest(BaseModel):
@@ -199,13 +205,16 @@ def project_sessions_and_view(
     }
     raw_nodes = vector.get_many(build_filter(**scope, layers=[Layer.L0_RAW]), None)
     proc_nodes = vector.get_many(build_filter(**scope, kinds=[PROCEDURE_KIND]), None)
+    boundaries = source_boundaries([*raw_nodes, *proc_nodes])
     sessions = workspace_sessions([*raw_nodes, *proc_nodes], workspace)
     session_set = set(sessions)
     now = int(time.time())
 
     live_procs = [
         n
-        for n in matching_workspace_nodes(proc_nodes, workspace, session_ids=session_set)
+        for n in matching_workspace_nodes(
+            proc_nodes, workspace, session_ids=session_set, boundaries=boundaries
+        )
         if _is_active_head(n, now)
     ]
     live_procs.sort(
@@ -229,26 +238,78 @@ def project_sessions_and_view(
             for n in project_facts
             if _is_active_head(n, now)
             and n.owner not in ("agent", "assistant")
-            and not (n.custom or {}).get("negation")
+            and node_matches_workspace(
+                n, workspace, session_ids=session_set, boundaries=boundaries
+            )
         ]
-        # Explicit profile/rules first, then newest user-confirmed project facts/decisions.
-        conventions.sort(
-            key=lambda n: (
-                1 if n.layer == Layer.L2_PROFILE else 0,
-                n.memory_at or n.gmt_created or 0,
-                n.node_id,
-            ),
-            reverse=True,
-        )
+        conventions = _select_project_conventions(conventions)
 
     if not conventions and not live_procs:
         return sessions, None
     view = {
         "workspace": canonical_workspace(workspace),
-        "conventions": [Reader.memory_node_to_item(n).to_dict() for n in conventions[:12]],
+        "conventions": [Reader.memory_node_to_item(n).to_dict() for n in conventions],
         "procedures": [Reader.memory_node_to_item(n).to_dict() for n in live_procs[:20]],
     }
     return sessions, view
+
+
+def _select_project_conventions(nodes: list[MemoryNode]) -> list[MemoryNode]:
+    """Newest user rules first, with a separate profile quota.
+
+    A current ``ADD_NEGATE`` head is the live conclusion (``negation=True``) and
+    stays. Profiles cannot fill the directory and drop an explicit L1 rule.
+    """
+
+    def recency(node: MemoryNode) -> tuple[int, str]:
+        return (node.memory_at or node.gmt_created or 0, node.node_id)
+
+    facts = sorted(
+        (n for n in nodes if n.layer != Layer.L2_PROFILE), key=recency, reverse=True
+    )
+    profiles = sorted(
+        (n for n in nodes if n.layer == Layer.L2_PROFILE), key=recency, reverse=True
+    )
+    profile_take = min(len(profiles), _PROJECT_PROFILE_QUOTA)
+    fact_take = min(len(facts), _PROJECT_CONVENTION_LIMIT - profile_take)
+    return facts[:fact_take] + profiles[:profile_take]
+
+
+def retired_claims_by_source(
+    nodes: list[MemoryNode], raw_ids: set[str]
+) -> dict[str, list[str]]:
+    """Superseded or archived wording of a raw dialogue, keyed by L0 id.
+
+    A current head is the live conclusion, including an ``ADD_NEGATE`` head.
+    Only non-latest versions and archived deletes are retired.
+    """
+    retired: dict[str, list[str]] = {}
+    for node in nodes:
+        custom = node.custom or {}
+        if node.is_latest and not custom.get("archived"):
+            continue
+        text = node.content.strip()
+        if not text:
+            continue
+        refs = {
+            str(s)
+            for s in [custom.get("source_node_id"), *(custom.get("source_ids") or [])]
+            if s
+        }
+        for rid in refs & raw_ids:
+            retired.setdefault(rid, []).append(node.content)
+    return retired
+
+
+def _hub_readable(node: MemoryNode, app_id: str) -> bool:
+    """Same scope as the short-prefix scan: this hub, non-raw, personal agent."""
+    return (
+        node.layer in _HUB_READ_LAYERS
+        and node.app_id == app_id
+        and node.user_id == HUB_USER_ID
+        and node.agent_id == ""
+        and node.status == MemoryStatus.ACTIVE
+    )
 
 
 def project_sessions(client: MemoryClient, workspace: str) -> list[str]:
@@ -717,18 +778,7 @@ def create_hub_app(
                     ),
                     None,
                 )
-                retired_by_raw: dict[str, list[str]] = {}
-                for n in all_curated:
-                    custom = n.custom or {}
-                    if n.is_latest and not custom.get("archived") and not custom.get("negation"):
-                        continue
-                    refs = {
-                        str(s)
-                        for s in [custom.get("source_node_id"), *(custom.get("source_ids") or [])]
-                        if s
-                    }
-                    for rid in refs & raw_ids:
-                        retired_by_raw.setdefault(rid, []).append(n.content)
+                retired_by_raw = retired_claims_by_source(all_curated, raw_ids)
                 for c in conv_dicts:
                     claims = retired_by_raw.get(c.get("memory_id", ""))
                     if claims:
@@ -794,12 +844,9 @@ def create_hub_app(
         core_client: MemoryClient = app.state.client
         vector = core_client.factory.vector
 
+        app_id = core_client.settings.default_app_id
         node = await asyncio.to_thread(vector.get, needle)
-        if node is not None and (
-            node.layer == Layer.L0_RAW
-            or node.app_id != core_client.settings.default_app_id
-            or node.user_id != HUB_USER_ID
-        ):
+        if node is not None and not _hub_readable(node, app_id):
             node = None
         if node is None:
             ids = await asyncio.to_thread(
@@ -823,7 +870,7 @@ def create_hub_app(
                     status_code=404, detail=f"memory {needle!r} not found"
                 )
             node = await asyncio.to_thread(vector.get, hits[0])
-            if node is None:
+            if node is None or not _hub_readable(node, app_id):
                 raise HTTPException(
                     status_code=404, detail=f"memory {needle!r} not found"
                 )

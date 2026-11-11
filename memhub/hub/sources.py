@@ -726,26 +726,34 @@ def _parse_pi(record: dict, state: dict) -> tuple[str, str, str, int | None] | N
         state["session_id"] = record["id"]
         state["workspace"] = record.get("cwd")
         return None
-    if kind == "bashExecution" and isinstance(record.get("exitCode"), int) and not isinstance(record.get("exitCode"), bool):
-        code = record["exitCode"]
-        at = _ms_seconds(record.get("timestamp"))
+    if kind != "message":
+        return None
+    message = record["message"]
+    role = message["role"]
+    if role == "bashExecution":
+        code = message.get("exitCode")
+        if isinstance(code, bool) or not isinstance(code, int):
+            return None
+        raw_at = message.get("timestamp")
+        if isinstance(raw_at, int) and not isinstance(raw_at, bool):
+            at = _ms_seconds(raw_at)
+        elif isinstance(raw_at, str):
+            at = _iso_seconds(raw_at)
+        else:
+            at = _iso_seconds(record.get("timestamp"))
         sig = {
             "tool": "bash",
-            "target": str(record.get("command") or "")[:120],
+            "target": str(message.get("command") or "")[:120],
             "at": at,
             "ok": code == 0,
             "exit_code": code,
         }
         if code != 0:
-            err = _error_preview(record.get("output"))
+            err = _error_preview(message.get("output"))
             if err:
                 sig["error"] = err
         state["signals"].append(sig)
         return "assistant", "", state["session_id"], at
-    if kind != "message":
-        return None
-    message = record["message"]
-    role = message["role"]
     if role == "toolResult" and message.get("isError") is True:
         at = _ms_seconds(message.get("timestamp"))
         sig = {

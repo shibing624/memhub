@@ -2,13 +2,19 @@
 
 ## Unreleased
 
+- **修复项目视图、注入预算与 `memory_get` 的隔离和保留错误**：
+  - `GET /v1/hub/memories/{memory_id}` 的完整 ID 与 `>=8` 位短前缀共用同一范围：本 Hub、`user_id=default`、`agent_id=""`、非 `L0_RAW`。此前完整 ID 不校验 `agent_id`，能读到同一库里其他 agent 的记忆。
+  - 项目视图先认节点自己的 workspace，再认 `L0` 来源边界；两者都没有时才用 session 兜底。同一 session 先写项目 A 再写项目 B 时，查 A 不再带出 B 的规矩和 procedure。
+  - 注入预算先确定最终保留的完整条目，再按这些 id 从项目视图去重。动态召回尾部被预算删掉的项目红线会回到固定视图，不再从两条路径同时消失；超长事实整条保留或整条去掉，不再从中间截断、把末尾禁止条件切掉。
+  - 项目视图里 `L2_PROFILE` 最多占 4 条，其余名额留给更新的 `L1` 规矩。12 条画像不再把后写入的项目红线挤出目录。当前生效的 `ADD_NEGATE` 结论留在视图里。
+  - Pi / OpenClaw 的 shell 结果在 `type="message"`、`message.role="bashExecution"` 上取 `exitCode`，时间用消息内的毫秒或记录上的 ISO 字符串。不再去顶层 `type=="bashExecution"` 上对 ISO 时间调用 `_ms_seconds`。
 - **修复 DeepSeek Harness（`dsh`）MCP 插件名与 `cordis.patch.yml` 插入语法错误导致工具不加载的问题**：
   - 此前 `DshMcp` 写入的是不存在的 `@deepseek-ai/dsh-mcp-manager`（嵌套 `config.servers.memhub`），导致 DeepSeek Harness Desktop/CLI 启动时忽略该条目、会话中不出现任何 `mcp__memhub__*` 工具。
   - 现改为使用官方内置的 `@deepseek-ai/dsh-mcp-client`（平铺 `serverName: memhub`、`transport: stdio`、`command`、`args`），并按 Cordis Loader 补丁方言包裹在顶层 `- insert: [ - id: mcp-memhub ... ]` 中（在 `cordis.patch.yml` 中若直接写顶层 `- id: mcp-memhub` 而不带 `insert:`，会被当作对已有条目的覆盖因目标不存在而被跳过）。重跑 `memhub install-host dsh` 会自动清理旧的 `mcp-manager` 条目并原地迁移。
 - **渐进式记忆披露闭环、实时项目约定视图与全入口执行证据留存**：
   - **抽取职责与噪音收敛**：`CodingMemoryExtractor` 提示词明确区分可复用的工程隐性规则/根因/决策（latent rules）与读当前代码即可获知的临时会话状态（ephemeral state）；`Extractor.extract_system1` 排除助手单次操作过程播报（如“助手修改/运行/确认了…”），同时在含工具调用的混合会话与无工具架构讨论会话中继续保留具体的助手事实（地址、命令、参数、技术依据）与用户事实，不按“是否含工具调用”一刀切丢弃 `owner="agent"`。
   - **按 ID 精确展开记忆（`memory_get`）与有预算的渐进披露**：Core 新增 `GET /v1/hub/memories/{memory_id}`（`HubClient.get_memory`），支持完整 ID 或唯一 `>=8` 位短前缀精确读取单条记忆及其完整 `procedure` 结构；Hub MCP 新增 `memory_get(memory_id)` 工具，CLI 新增 `memhub memory-get <id>`，并同步更新 `memhub-recall` skill（已安装宿主可重跑 `memhub install-host`）。`Settings` 新增实验参数 `hub_inject_max_chars`（默认 `3000`）、`hub_inject_max_lines`（默认 `120`）与 `hub_procedure_full_score`（默认 `0.40`）：未达完整展开阈值或超出预算的 `procedure` 自动降级为带 `id`、任务标题、适用边界（`scope`/`branch`/`env`/`files`）与 `L0` 来源的单行 `[procedure-index id=...]` 目录项，避免截断命令或否定约束。
-  - **同源 `L0_RAW` 增量压缩与旧说法复活拦截**：`memhub.retrieval.hybrid_engine` 新增 `novel_source_excerpt`，同源 `L0_RAW` 对话不再因 `source_node_id` 相同被整段删除，而是优先过滤已被召回记忆覆盖的重复段落，在压缩预算内保留尚未表达的日期、封版条件、回滚联系人等上下文；同时 `/v1/hub/recall` 标记同源中已被覆盖更新（`not is_latest`）、否定撤回（`negation`）或归档删除（`archived`）的旧陈述，防止 `L0_RAW` 原文兜底把已废止的旧规矩重新注入上下文。
+  - **同源 `L0_RAW` 增量压缩与旧说法复活拦截**：`memhub.retrieval.hybrid_engine` 新增 `novel_source_excerpt`，同源 `L0_RAW` 对话不再因 `source_node_id` 相同被整段删除，而是优先过滤已被召回记忆覆盖的重复段落，在压缩预算内保留尚未表达的日期、封版条件、回滚联系人等上下文；同时 `/v1/hub/recall` 标记同源中已被新版本替代（`not is_latest`）或归档删除（`archived`）的旧陈述。只删除与旧陈述措辞一致的片段；对不上原文时保留该段并注明以当前记忆为准。当前仍生效的否定结论（`ADD_NEGATE` 且 `is_latest`）不是退役内容。
   - **与 Query 措辞无关的实时项目约定视图（Project View）**：`/v1/hub/recall`（及 `memhub recall --workspace`）直接从本机库当前生效版本（`is_latest=True`）实时构建该 `workspace` 的项目约定与工程经验目录，与动态召回共享 `3000` 字预算并自动去重；解决提问未命中规矩关键词（如只问“补单测”未提“生产库”）时的红线漏召回，且在 `memory_update` / `memory_delete` / 版本替换后立即生效，无离线缓存延迟。
   - **全采集入口执行证据（`tool_signals`）与本机实时文件漂移提示**：`extract_tool_signals` 与 Hub 采集器（Agentica、Claude Code、Qoder、Codex、CodeBuddy、WorkBuddy、Pi、OpenClaw、Copilot、Cline、OpenCode、ZCode）在 `L0_RAW.custom["tool_signals"]` 中记录带步骤序号 `seq`、`call_id`、工具名、命令/路径摘要 `target`、时间戳 `at`、`ok`、`exit_code` 及有界脱敏报错摘要 `error` 的结构化执行证据（工具原始大输出仍不入库）；`memhub.hub.browse.inspect_local_procedure_files` 在本机工作区存在时对项目级 `procedure` 提供实时、可恢复的文件缺失与当前分支核验提示，不改写向量库、不降低检索分、不跨设备同步，也不误标 `user`/`global` 级通用规则。
 - **修复工程记忆超过候选上限时抛 `CodingDecisionError` 导致后台写入失败，并增强写入队列自愈**：

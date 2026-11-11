@@ -361,28 +361,87 @@ def workspace_sessions(nodes: list[MemoryNode], workspace: str) -> list[str]:
     return sorted(sessions)
 
 
+def source_boundaries(nodes: list[MemoryNode]) -> dict[str, tuple[str, str]]:
+    """L0 id -> ``(workspace, remote)``.
+
+    An L0's own workspace wins. A procedure only fills a source that has none.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    for node in nodes:
+        workspace = node_workspace(node)
+        if not workspace:
+            continue
+        remote = str((node.custom or {}).get("workspace_remote") or "")
+        if procedure_detail(node) is None:
+            out[node.node_id] = (workspace, remote)
+            continue
+        for source_id in (node.custom or {}).get("source_ids") or []:
+            if source_id:
+                out.setdefault(str(source_id), (workspace, remote))
+    return out
+
+
+def node_matches_workspace(
+    node: MemoryNode,
+    workspace: str,
+    *,
+    session_ids: set[str] | None = None,
+    boundaries: dict[str, tuple[str, str]] | None = None,
+    keys_cache: dict[str, set[str]] | None = None,
+    git_cache: dict[str, tuple[bool, bool, str]] | None = None,
+) -> bool:
+    """Whether ``node`` belongs to ``workspace``.
+
+    An explicit workspace on the node, then an L0 source boundary, decide first.
+    Session membership is only the fallback when neither boundary was recorded,
+    so a session that later switched projects cannot pull the other project's
+    rules in.
+    """
+    keys = keys_cache if keys_cache is not None else {}
+    git = git_cache if git_cache is not None else {}
+    sessions = session_ids or set()
+    found = node_workspace(node)
+    if found:
+        remote = str((node.custom or {}).get("workspace_remote") or "")
+        return _workspaces_match(found, remote, workspace, keys, git)
+    custom = node.custom or {}
+    ordered: list[str] = []
+    primary = custom.get("source_node_id")
+    if primary:
+        ordered.append(str(primary))
+    for sid in custom.get("source_ids") or []:
+        text = str(sid)
+        if text and text not in ordered:
+            ordered.append(text)
+    known = [boundaries[sid] for sid in ordered if boundaries and sid in boundaries]
+    if known:
+        bound_workspace, bound_remote = known[0]
+        return _workspaces_match(bound_workspace, bound_remote, workspace, keys, git)
+    return bool(node.session_id and node.session_id in sessions)
+
+
 def matching_workspace_nodes(
     nodes: list[MemoryNode],
     workspace: str,
     *,
     session_ids: set[str] | None = None,
+    boundaries: dict[str, tuple[str, str]] | None = None,
 ) -> list[MemoryNode]:
-    """Subset of ``nodes`` belonging to ``workspace`` (by workspace boundary or session)."""
+    """Subset of ``nodes`` belonging to ``workspace`` (workspace, then source, then session)."""
     keys_cache: dict[str, set[str]] = {}
     git_cache: dict[str, tuple[bool, bool, str]] = {}
-    sessions = session_ids or set()
-    matched: list[MemoryNode] = []
-    for node in nodes:
-        if node.session_id and node.session_id in sessions:
-            matched.append(node)
-            continue
-        found = node_workspace(node)
-        if not found:
-            continue
-        remote = str((node.custom or {}).get("workspace_remote") or "")
-        if _workspaces_match(found, remote, workspace, keys_cache, git_cache):
-            matched.append(node)
-    return matched
+    return [
+        node
+        for node in nodes
+        if node_matches_workspace(
+            node,
+            workspace,
+            session_ids=session_ids,
+            boundaries=boundaries,
+            keys_cache=keys_cache,
+            git_cache=git_cache,
+        )
+    ]
 
 
 def browse_rows(nodes: list[MemoryNode]) -> list[dict[str, Any]]:
@@ -447,7 +506,9 @@ __all__ = [
     "git_remote_slug",
     "inspect_local_procedure_files",
     "matching_workspace_nodes",
+    "node_matches_workspace",
     "node_workspace",
+    "source_boundaries",
     "parse_origin_slug",
     "resolve_workspace_root",
     "workspace_keys",

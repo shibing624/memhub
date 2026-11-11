@@ -20,9 +20,14 @@ from memhub.config import Settings
 from memhub.hub.browse import inspect_local_procedure_files
 from memhub.hub.client import HubClient
 from memhub.hub.config import CursorStore
-from memhub.hub.server import create_hub_app
+from memhub.hub.server import (
+    create_hub_app,
+    project_sessions_and_view,
+    retired_claims_by_source,
+)
 from memhub.hub.sources import SOURCE_SPECS, build_turns, default_source_roots, scan_file
-from memhub.types import Layer
+from memhub.retrieval.hybrid_engine import novel_source_excerpt
+from memhub.types import Layer, MemoryNode
 
 
 def _jsonl(path: Path, records: list[dict]) -> None:
@@ -770,3 +775,343 @@ async def test_execution_signals_wired_across_agentica_claude_codex_and_sdk_with
             assert cx_sig["target"] == "ruff check ."
             assert "F401 unused import" in cx_sig["error"]
     await core.aclose()
+
+
+def _zero(dim: int = 64) -> list[float]:
+    return [0.0] * dim
+
+
+def _stored(
+    content: str,
+    layer: Layer,
+    *,
+    session_id: str = "",
+    agent_id: str = "",
+    owner: str = "user",
+    custom: dict | None = None,
+    kind: str = "",
+    is_latest: bool = True,
+    memory_at: int = 1_700_000_000,
+    node_id: str = "",
+) -> MemoryNode:
+    return MemoryNode(
+        content=content,
+        layer=layer,
+        app_id="default",
+        user_id="default",
+        agent_id=agent_id,
+        session_id=session_id,
+        owner=owner,
+        kind=kind,
+        is_latest=is_latest,
+        memory_at=memory_at,
+        embedding=_zero(),
+        custom=custom,
+        **({"node_id": node_id} if node_id else {}),
+    )
+
+
+def _procedure_custom(workspace: str, task: str, source_id: str) -> dict:
+    return {
+        "source_node_id": source_id,
+        "source_ids": [source_id],
+        "procedure": {
+            "task": task,
+            "solution": "do the thing",
+            "search_keys": ["k"],
+            "boundary_envs": "",
+            "boundary_scope": "project",
+            "files": [],
+            "workspace_id": workspace,
+            "branch": "main",
+            "confidence": 0.7,
+        },
+    }
+
+
+async def test_memory_get_full_id_rejects_other_agent(tmp_path: Path, fake_embed) -> None:
+    core = MemoryClient(
+        settings=Settings(storage_dir=str(tmp_path / "store"), mode="system1", embed_dim=64),
+        embed=fake_embed,
+        llm=FakeLLMClient({"json": {"candidates": []}}),
+        jev=FakeJev(),
+    )
+    own = _stored("本机个人记忆：提交信息只写一行", Layer.L1_FACT)
+    other = _stored(
+        "其他 agent 的账单规则",
+        Layer.L1_FACT,
+        agent_id="billing-bot",
+    )
+    core.factory.vector.upsert([own, other])
+    app = create_hub_app(api_key="secret", hub_dir=tmp_path / "hub", client=core, settings=core.settings)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with HubClient(base_url="http://hub", api_key="secret", transport=transport) as hub:
+            got = await hub.get_memory(own.node_id)
+            assert got["memory_id"] == own.node_id
+            with pytest.raises(httpx.HTTPStatusError) as exc_full:
+                await hub.get_memory(other.node_id)
+            assert exc_full.value.response.status_code == 404
+            with pytest.raises(httpx.HTTPStatusError) as exc_prefix:
+                await hub.get_memory(other.node_id[:8])
+            assert exc_prefix.value.response.status_code == 404
+    await core.aclose()
+
+
+async def test_project_view_keeps_workspace_boundary_across_a_shared_session(
+    tmp_path: Path, fake_embed
+) -> None:
+    core = MemoryClient(
+        settings=Settings(storage_dir=str(tmp_path / "store"), mode="system1", embed_dim=64),
+        embed=fake_embed,
+        llm=FakeLLMClient({"json": {"candidates": []}}),
+        jev=FakeJev(),
+    )
+    l0_a = _stored(
+        "[user]: 项目 A",
+        Layer.L0_RAW,
+        session_id="cursor:shared",
+        custom={"workspace_id": "/w/proj-a"},
+    )
+    l0_b = _stored(
+        "[user]: 项目 B",
+        Layer.L0_RAW,
+        session_id="cursor:shared",
+        custom={"workspace_id": "/w/proj-b"},
+    )
+    fact_a = _stored(
+        "项目A红线：金额用整数分",
+        Layer.L1_FACT,
+        session_id="cursor:shared",
+        custom={"source_node_id": l0_a.node_id, "source_ids": [l0_a.node_id]},
+    )
+    fact_b = _stored(
+        "项目B红线：日志必须 JSON",
+        Layer.L1_FACT,
+        session_id="cursor:shared",
+        custom={"source_node_id": l0_b.node_id, "source_ids": [l0_b.node_id]},
+    )
+    loose = _stored(
+        "这条没有项目边界，跟 session 走",
+        Layer.L1_FACT,
+        session_id="cursor:shared",
+        custom={},
+    )
+    proc_b = _stored(
+        "B procedure",
+        Layer.L1_FACT,
+        session_id="cursor:shared",
+        kind="procedure",
+        custom=_procedure_custom("/w/proj-b", "如何给项目 B 打日志", l0_b.node_id),
+    )
+    old = _stored(
+        "项目要求上线前审批",
+        Layer.L1_FACT,
+        session_id="cursor:shared",
+        is_latest=False,
+        custom={"source_node_id": l0_a.node_id, "source_ids": [l0_a.node_id]},
+    )
+    negated = _stored(
+        "项目不再要求审批",
+        Layer.L1_FACT,
+        session_id="cursor:shared",
+        memory_at=1_700_000_100,
+        custom={
+            "negation": True,
+            "update_type": "NEGATE",
+            "source_node_id": l0_a.node_id,
+            "source_ids": [l0_a.node_id],
+        },
+    )
+    profiles = [
+        _stored(
+            f"用户画像 {i}：喜欢第 {i} 种编辑器主题",
+            Layer.L2_PROFILE,
+            session_id="cursor:shared",
+            memory_at=1_600_000_000 + i,
+            custom={"source_node_id": l0_a.node_id, "source_ids": [l0_a.node_id]},
+        )
+        for i in range(12)
+    ]
+    red_line = _stored(
+        "项目A新红线：测试永远使用 pytest tmp_path，严禁读写生产库",
+        Layer.L1_FACT,
+        session_id="cursor:shared",
+        memory_at=1_800_000_000,
+        custom={"source_node_id": l0_a.node_id, "source_ids": [l0_a.node_id]},
+    )
+    core.factory.vector.upsert(
+        [l0_a, l0_b, fact_a, fact_b, loose, proc_b, old, negated, red_line, *profiles]
+    )
+
+    _, view_a = project_sessions_and_view(core, "/w/proj-a")
+    assert view_a is not None
+    texts = [item["content"] for item in view_a["conventions"]]
+    assert "项目A红线：金额用整数分" in texts
+    assert "项目不再要求审批" in texts
+    assert "项目A新红线：测试永远使用 pytest tmp_path，严禁读写生产库" in texts
+    assert "项目B红线：日志必须 JSON" not in texts
+    assert "项目要求上线前审批" not in texts
+    assert any("没有项目边界" in text for text in texts)
+    assert sum(1 for text in texts if text.startswith("用户画像")) <= 4
+    proc_tasks = [item["procedure"]["task"] for item in view_a["procedures"]]
+    assert proc_tasks == []
+
+    _, view_b = project_sessions_and_view(core, "/w/proj-b")
+    assert view_b is not None
+    texts_b = [item["content"] for item in view_b["conventions"]]
+    assert "项目B红线：日志必须 JSON" in texts_b
+    assert "项目A红线：金额用整数分" not in texts_b
+    assert [item["procedure"]["task"] for item in view_b["procedures"]] == ["如何给项目 B 打日志"]
+
+    retired = retired_claims_by_source(
+        core.factory.vector.get_many({"user_id": "default"}, limit=100),
+        {l0_a.node_id},
+    )
+    assert retired[l0_a.node_id] == ["项目要求上线前审批"]
+    await core.aclose()
+
+
+def test_budget_returns_dropped_rule_to_project_view_without_slicing() -> None:
+    red_line = "项目红线：测试只用 tmp_path。严禁读写 /data/prod.db"
+    fillers = [
+        {
+            "memory_id": f"fill-{idx}",
+            "content": f"填充事实 {idx} " + ("细节 " * 40),
+            "category": "fact",
+            "layer": "L1_FACT",
+            "owner": "user",
+            "score": 0.9 - idx * 0.01,
+        }
+        for idx in range(3)
+    ]
+    payload = {
+        "memories": {
+            "profile": [],
+            "proactive": [],
+            "normal": [
+                *fillers,
+                {
+                    "memory_id": "rule-red",
+                    "content": "项目红线：测试只用 tmp_path。\n严禁读写 /data/prod.db",
+                    "category": "fact",
+                    "layer": "L1_FACT",
+                    "owner": "user",
+                    "score": 0.2,
+                },
+            ],
+            "procedures": [],
+        },
+        "project_view": {
+            "workspace": "/w/ledger",
+            "conventions": [
+                {
+                    "memory_id": "rule-red",
+                    "content": red_line,
+                    "layer": "L1_FACT",
+                    "owner": "user",
+                }
+            ],
+            "procedures": [],
+        },
+        "conversations": [],
+        "inject_policy": {"max_chars": 420, "max_lines": 40, "procedure_full_score": 0.40},
+    }
+    ctx = build_hub_prompt_context(payload, "补一个回归用例")
+    assert "严禁读写 /data/prod.db" in ctx
+    assert len(ctx) <= 420
+
+    huge = "开头保留的说明。\n" + ("中间填充。\n" * 40) + "末尾禁止：严禁 DROP。"
+    sliced = build_hub_prompt_context(
+        {
+            "memories": {
+                "normal": [
+                    {
+                        "memory_id": "huge-1",
+                        "content": huge,
+                        "category": "fact",
+                        "layer": "L1_FACT",
+                        "score": 0.5,
+                    }
+                ]
+            },
+            "conversations": [],
+            "inject_policy": {"max_chars": 180, "max_lines": 8, "procedure_full_score": 0.40},
+        },
+        "能不能直接删列",
+    )
+    if "开头保留的说明" in sliced:
+        assert "严禁 DROP" in sliced
+    assert len(sliced) <= 180
+
+
+def test_retired_wording_does_not_delete_an_unrelated_same_source_fact() -> None:
+    kept = novel_source_excerpt(
+        "[user]: 测试使用生产数据库。生产数据库每晚备份到异地冷存。",
+        "备份策略是什么？",
+        [],
+        retired_texts=["测试使用生产数据库"],
+    )
+    assert "每晚备份" in kept
+    assert "测试使用生产数据库" not in kept
+
+    untouched = novel_source_excerpt(
+        "[user]: 生产数据库每晚备份到异地冷存。",
+        "备份策略是什么？",
+        [],
+        retired_texts=["测试使用生产数据库"],
+    )
+    assert "每晚备份" in untouched
+    assert "已废止说法" in untouched
+
+
+def test_pi_bash_execution_signal_reads_message_role(tmp_path: Path) -> None:
+    path = tmp_path / "2026-11-08T10-00-00-000Z_pi-bash.jsonl"
+    _jsonl(
+        path,
+        [
+            {"type": "session", "id": "pi-bash", "cwd": "/Users/me/pi"},
+            {
+                "type": "message",
+                "timestamp": "2026-11-08T10:00:01.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "跑一下"}],
+                    "timestamp": 1794144606000,
+                },
+            },
+            {
+                "type": "message",
+                "id": "b1",
+                "timestamp": "2026-11-08T10:00:02.000Z",
+                "message": {
+                    "role": "bashExecution",
+                    "command": "pytest -q",
+                    "output": "2 failed",
+                    "exitCode": 2,
+                },
+            },
+            {
+                "type": "message",
+                "timestamp": "2026-11-08T10:00:03.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "失败了"}],
+                    "timestamp": 1794144609000,
+                },
+            },
+        ],
+    )
+    messages, _ = SOURCE_SPECS["pi"].read(path, 0)
+    _, turn = build_turns(messages)
+    assert turn is not None
+    assert "2 failed" not in turn.assistant
+    sig = turn.signals[0]
+    assert (sig["tool"], sig["exit_code"], sig["ok"], sig["target"]) == (
+        "bash",
+        2,
+        False,
+        "pytest -q",
+    )
+    assert isinstance(sig["at"], int) and sig["at"] > 0
+    assert "2 failed" in sig["error"]

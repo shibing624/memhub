@@ -584,26 +584,6 @@ def _other_host(source: str, payload: dict[str, Any]) -> bool:
     return source not in ("cursor", "trae") and "workspace_roots" in payload
 
 
-def _cap_block(text: str, max_chars: int, max_lines: int = 0) -> str:
-    out = text
-    truncated = False
-    if max_lines > 0:
-        lines = out.splitlines()
-        if len(lines) > max_lines:
-            out = "\n".join(lines[: max(max_lines - 1, 1)])
-            truncated = True
-    suffix = "\n(… 其余记忆已省略，可按需调用 memory_search / memory_get 深读)"
-    if max_chars > 0 and len(out) > max_chars:
-        limit = max(max_chars - len(suffix), 0)
-        cut = out.rfind("\n", 0, limit)
-        out = out[: cut if cut > 0 else limit].rstrip()
-        truncated = True
-    if truncated and not out.endswith(suffix):
-        if max_chars <= 0 or len(out) + len(suffix) <= max_chars:
-            out = f"{out}{suffix}"
-    return out
-
-
 def _with_local_drift(items: list[dict], workspace: str | None) -> list[dict]:
     """Attach device-local file-presence hints without mutating caller/store dicts."""
     if not items:
@@ -663,58 +643,64 @@ def build_hub_prompt_context(
             "procedures": _with_local_drift(raw_view.get("procedures") or [], workspace),
         }
 
-    dynamic_ids = {
-        str(it.get("memory_id") or it.get("id"))
-        for group in ("profile", "proactive", "normal", "procedures")
-        for it in (memories.get(group) or [])
-        if isinstance(it, dict) and (it.get("memory_id") or it.get("id"))
-    }
-    view_budget = int(char_cap * 0.40) if char_cap > 0 else 1200
-    view_block, view_ids = format_project_view(
-        project_view, exclude_ids=dynamic_ids, max_chars=max(view_budget, 240) if project_view else 0
-    )
+    # Decide the complete items that fit, then dedupe the project view against
+    # only those survivors. Dropping a trailing recall item must put a project
+    # rule back into the view; never cut a fact in the middle of its text.
+    def _kept_ids(mems: dict[str, Any]) -> set[str]:
+        return {
+            str(it.get("memory_id") or it.get("id"))
+            for group in ("profile", "proactive", "normal", "procedures")
+            for it in (mems.get(group) or [])
+            if isinstance(it, dict) and (it.get("memory_id") or it.get("id"))
+        }
 
-    # Fit curated memories by demoting full procedures to 1-line indices first, then
-    # dropping lowest-ranked trailing normal items before ever slicing mid-item.
+    def _within(text: str) -> bool:
+        if char_cap > 0 and len(text) > char_cap:
+            return False
+        if line_cap > 0 and len(text.splitlines()) > line_cap:
+            return False
+        return True
+
+    view_budget = (
+        1200 if char_cap <= 0 else min(char_cap, max(int(char_cap * 0.40), 240))
+    )
     working_memories = dict(memories)
     chosen_full_procs = MAX_FULL_PROCEDURES
+    view_block, view_ids = "", set()
     mem_block = ""
-    for full_cap in (MAX_FULL_PROCEDURES, 1, 0):
-        chosen_full_procs = full_cap
-        mem_block = format_memories(
-            working_memories,
-            procedure_full_score=proc_threshold,
-            max_full_procedures=full_cap,
-        ).strip()
-        combined = "\n\n".join(b for b in (view_block, mem_block) if b)
-        within_chars = char_cap <= 0 or len(combined) <= char_cap
-        within_lines = line_cap <= 0 or len(combined.splitlines()) <= line_cap
-        if within_chars and within_lines:
-            break
-
-    while working_memories.get("normal"):
-        combined = "\n\n".join(b for b in (view_block, mem_block) if b)
-        within_chars = char_cap <= 0 or len(combined) <= char_cap
-        within_lines = line_cap <= 0 or len(combined.splitlines()) <= line_cap
-        if within_chars and within_lines:
-            break
-        if len(working_memories["normal"]) <= 1:
-            break
-        working_memories = {
-            **working_memories,
-            "normal": working_memories["normal"][:-1],
-        }
+    curated = ""
+    for _ in range(64):
+        view_block, view_ids = format_project_view(
+            project_view,
+            exclude_ids=_kept_ids(working_memories),
+            max_chars=view_budget if project_view else 0,
+        )
         mem_block = format_memories(
             working_memories,
             procedure_full_score=proc_threshold,
             max_full_procedures=chosen_full_procs,
         ).strip()
-
-    curated = "\n\n".join(b for b in (view_block, mem_block) if b).strip()
-    if (char_cap > 0 and len(curated) > char_cap) or (
-        line_cap > 0 and len(curated.splitlines()) > line_cap
-    ):
-        curated = _cap_block(curated, char_cap, line_cap)
+        curated = "\n\n".join(b for b in (view_block, mem_block) if b).strip()
+        if _within(curated):
+            break
+        if chosen_full_procs > 0:
+            chosen_full_procs = 0 if chosen_full_procs == 1 else 1
+            continue
+        reduced = False
+        for group in ("normal", "proactive", "profile", "procedures"):
+            items = list(working_memories.get(group) or [])
+            if items:
+                working_memories = {**working_memories, group: items[:-1]}
+                reduced = True
+                break
+        if reduced:
+            continue
+        if view_block and view_budget > 0:
+            nxt = len(view_block) - len(view_block.splitlines()[-1]) - 1
+            if nxt < view_budget:
+                view_budget = max(0, nxt)
+                continue
+        break
 
     covered = covered_texts_by_source(
         working_memories,

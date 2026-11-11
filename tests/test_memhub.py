@@ -813,6 +813,11 @@ def test_readers_keep_only_real_dialogue(tmp_path: Path) -> None:
         ):
             assert leaked not in dumped_pi, leaked
         assert "/Users/me/pi/a.py" in dumped_pi
+        bash = [s for s in pi_turn.signals if s.get("tool") == "bash"]
+        assert len(bash) == 1
+        assert bash[0]["exit_code"] == 0 and bash[0]["ok"] is True
+        assert bash[0]["target"] == "ls"
+        assert isinstance(bash[0]["at"], int)
     qo = turns["qoder"][0]
     assert (qo.user, qo.assistant) == ("单元测试用 pytest -q", "收到，用 pytest -q")
     assert (qo.session_id, qo.workspace, qo.branch) == ("qo-1", "/Users/me/qo", "main")

@@ -237,10 +237,36 @@ def source_excerpt(content: str, query: str, anchors: list[str], max_chars: int 
     return "\n[…]\n".join(passages[i] for i in sorted(selected))
 
 
-def _strip_retired_clauses(content: str, retired_only_terms: set[str]) -> str:
-    """Remove sentences/clauses carrying terms unique to superseded or deleted claims."""
-    if not retired_only_terms:
-        return content
+def _compact_span(text: str) -> str:
+    return re.sub(r"\s+", "", text).casefold()
+
+
+def _cut_phrase(span: str, phrase: str) -> str:
+    """Delete one whitespace-insensitive occurrence of ``phrase`` from ``span``."""
+    chars = [ch for ch in phrase if not ch.isspace()]
+    if not chars:
+        return span
+    pattern = r"\s*".join(re.escape(ch) for ch in chars)
+    return re.sub(pattern, "", span, count=1, flags=re.IGNORECASE)
+
+
+def _strip_retired_clauses(content: str, retired_texts: list[str]) -> tuple[str, bool]:
+    """Drop clauses that are a retired claim, and report whether every claim was found.
+
+    A shared token is not evidence: "生产数据库每晚备份" is a different fact from
+    the retracted "测试使用生产数据库". A clause is removed only when it contains
+    the retired wording, or it is itself a substantial fragment of that wording.
+    Claims that cannot be located stay in the text; the caller marks the version
+    relation instead of deleting the surrounding fact.
+    """
+    pairs = [
+        (text, _compact_span(text))
+        for text in retired_texts
+        if text and len(_compact_span(text)) >= 4
+    ]
+    if not pairs:
+        return content, True
+    found = [False] * len(pairs)
     kept_turns: list[str] = []
     for turn in re.split(r"(?m)(?=^\[(?:user|assistant|tool|system)\]:)", content):
         if not turn.strip():
@@ -251,22 +277,43 @@ def _strip_retired_clauses(content: str, retired_only_terms: set[str]) -> str:
         for sent in re.split(r"(?<=[。！？.!?\n；;])\s*", body):
             if not sent.strip():
                 continue
-            stoks = set(tokenize(sent))
-            if not (stoks & retired_only_terms):
-                kept_sentences.append(sent.strip())
-                continue
-            # A compound sentence ("超时设 2500ms，顺便修 keepalive") may mix a retired
-            # clause with an unrelated clause; keep clauses free of retired-only terms.
-            clauses = [
-                c.strip()
-                for c in re.split(r"[，,]", sent)
-                if c.strip() and not (set(tokenize(c)) & retired_only_terms)
-            ]
-            if clauses:
-                kept_sentences.append("，".join(clauses))
+            kept_clauses: list[str] = []
+            for clause in re.split(r"[，,]", sent):
+                piece = clause.strip()
+                if not piece:
+                    continue
+                norm = _compact_span(piece)
+                hit = False
+                for i, (raw, retired) in enumerate(pairs):
+                    if len(norm) >= 4 and retired in norm:
+                        found[i] = True
+                        hit = True
+                        piece = _cut_phrase(piece, raw).strip(" ，,；;。")
+                        norm = _compact_span(piece)
+                    elif len(norm) >= 4 and norm in retired and len(norm) / len(retired) >= 0.6:
+                        found[i] = True
+                        hit = True
+                        piece = ""
+                        break
+                cleaned = piece.strip(" ，,；;。")
+                if cleaned and (not hit or len(_compact_span(cleaned)) >= 4):
+                    kept_clauses.append(cleaned)
+            if kept_clauses:
+                kept_sentences.append("，".join(kept_clauses))
         if kept_sentences:
             kept_turns.append(f"{prefix}{' '.join(kept_sentences)}".strip())
-    return "\n".join(kept_turns)
+    return "\n".join(kept_turns), all(found)
+
+
+_RETIRED_NOTE = "（此段有已废止说法，以当前记忆为准）"
+
+
+def _with_retired_note(text: str, located: bool, max_chars: int) -> str:
+    if not text or located:
+        return text
+    if len(text) + 1 + len(_RETIRED_NOTE) > max_chars:
+        return text
+    return f"{text} {_RETIRED_NOTE}"
 
 
 def novel_source_excerpt(
@@ -281,26 +328,25 @@ def novel_source_excerpt(
 
     A single L0 batch can hold several turns, dates, conditions or failure steps while
     structured recall matched only one fact or procedure from it. Passages whose terms
-    are already covered verbatim are skipped, clauses carrying terms unique to retired
-    (superseded / negated / deleted) claims are stripped so stale rules never resurrect,
-    and remaining passages relevant to ``query`` are kept within ``max_chars``.
+    are already covered verbatim are skipped. A clause is removed only when its wording
+    is the retired claim; an unrelated sentence that merely shares a subject is kept,
+    with a version note when the retired wording cannot be located.
     """
     if max_chars <= 0 or not content.strip():
         return ""
     retired = [t for t in (retired_texts or []) if t and t.strip()]
-    active_terms = set(tokenize(" ".join(covered_texts)))
+    located = True
     if retired:
-        retired_only = set(tokenize(" ".join(retired))) - active_terms
-        content = _strip_retired_clauses(content, retired_only)
+        content, located = _strip_retired_clauses(content, retired)
         if not content.strip():
             return ""
     all_covered = [*covered_texts, *retired]
     if not all_covered:
-        return source_excerpt(content, query, [], max_chars)
+        return _with_retired_note(source_excerpt(content, query, [], max_chars), located, max_chars)
 
     covered_terms = set(tokenize(" ".join(all_covered)))
     if not covered_terms:
-        return source_excerpt(content, query, [], max_chars)
+        return _with_retired_note(source_excerpt(content, query, [], max_chars), located, max_chars)
 
     turns = re.split(r"(?m)(?=^\[(?:user|assistant|tool|system)\]:)", content)
     passages: list[str] = []
@@ -375,7 +421,9 @@ def novel_source_excerpt(
             break
     if not selected:
         return ""
-    return "\n[…]\n".join(passages[i] for i in sorted(selected))
+    return _with_retired_note(
+        "\n[…]\n".join(passages[i] for i in sorted(selected)), located, max_chars
+    )
 
 
 def _item_to_memory(item: dict) -> MemoryItem:
