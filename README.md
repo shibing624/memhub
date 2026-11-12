@@ -150,6 +150,7 @@ embed_base_url: https://api.openai.com/v1
 
 ## News
 
+- [2026/11/12] **v0.2.4**：宿主扩展到 18 种（新增 Kimi、DeepSeek Harness、Trae、ZCode、Qoder、GitHub Copilot、AWS Kiro、Cline、Pi、OpenClaw）。`memhub install-host` 不带参数时只接入本机已安装的工具。新增 `memhub doctor`、`memory_get` / `memhub memory-get`；召回按预算渐进披露工程经验，并附带与问法无关的实时项目约定。Agentica 的 Web、Desktop 与 IM 同 CLI 一样采集并注入记忆，纯 SDK 会话不入库。`/ui` 可按来源工具筛选，搜索框支持来源、会话 ID 与记忆短 ID。已安装的宿主需重跑 `memhub install-host`。详见 [Release-v0.2.4](https://github.com/shibing624/memhub/releases/tag/v0.2.4)。
 - [2026/11/03] **v0.2.3**：Cursor 对话自动采集，并在提问前注入本项目记忆；新增 `memhub remember` 写入个人记忆。宿主 skill（`memhub-recall`）与开发者 skill（`memhub-sdk`）分开，避免互相覆盖。`memhub ui` 改为浅白风格，并修复点击条目跳回顶部、中文输入被打断的问题。本机 `versions.db` 不再重复存放向量。已安装的宿主需重跑 `memhub install-host`。详见 [Release-v0.2.3](https://github.com/shibing624/memhub/releases/tag/v0.2.3)。
 - [2026/11/02] **v0.2.2**：项目与 PyPI 包名正式升级为 **`memhub`**（`pip install memhub`、`import memhub`、CLI `memhub`、配置 `~/.memhub/config.yaml`），所有 Hub 命令提升为 `memhub` 一级子命令（`memhub install-service`、`memhub install-host`、`memhub ui`、`memhub connect` 等）。新增本机可视化管理页 `memhub ui`（按项目浏览、混合检索、编辑生成新版本、删除同步）；新增支持 CodeBuddy、OpenCode、WorkBuddy（共 8 种宿主工具）；同步目标升级为 float16 向量压缩 + 快照折叠（不再无限增长）；每轮召回按项目限定并只截取相关对话段落，离线评测达到 35/36。详见 [Release-v0.2.2](https://github.com/shibing624/memhub/releases/tag/v0.2.2)。
 - [2026/11/01] **v0.2.1**：多设备改为每台电脑本地检索，用私有 git 仓库、网盘文件夹或服务器交换变更日志，删掉了常驻 SSH 隧道。模型配置与 Hub 目录统一。工程记忆只保留问题和最终回答，工具输出不再送进模型。自动归纳改为一天最多一次。详见 [Release-v0.2.1](https://github.com/shibing624/memhub/releases/tag/v0.2.1)。

@@ -22,7 +22,7 @@ from memhub.errors import (
 )
 from memhub.sync_client import SyncMemoryClient
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 # Library convention: install a NullHandler on the package logger so the SDK is silent
 # by default. The host application is responsible for configuring handlers.

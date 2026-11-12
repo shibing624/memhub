@@ -3767,5 +3767,86 @@ async def test_agentica_gateway_web_desktop_im_capture_and_sdk_exclusion(
     assert "agentica:uuid-sdk-1" not in sids
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node to evaluate ui.html script")
+def test_ui_sidebar_source_filter_and_search_matches_source_and_session(tmp_path: Path) -> None:
+    """``/ui`` filters by sidebar ``data-source`` and matches ``source``, ``session_id``, and ``id`` in the search input."""
+    html = (Path(__file__).resolve().parent.parent / "memhub" / "hub" / "ui.html").read_text(
+        encoding="utf-8"
+    )
+    script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+    harness = tmp_path / "ui_test.mjs"
+    harness.write_text(
+        """
+const elements = {};
+function makeEl(id = "") {
+  return {
+    id,
+    innerHTML: "",
+    textContent: "",
+    value: "",
+    checked: false,
+    scrollTop: 0,
+    style: {},
+    addEventListener() {},
+  };
+}
+for (const id of ["root", "sidebar", "main-scroll", "q", "clear-slot", "hist", "summary", "list", "toast"]) {
+  elements[id] = makeEl(id);
+}
+globalThis.location = { hash: "", pathname: "/ui" };
+globalThis.history = { replaceState() {} };
+globalThis.sessionStorage = { getItem: () => "", setItem() {} };
+globalThis.CSS = { escape: s => s };
+globalThis.document = {
+  activeElement: null,
+  getElementById: id => elements[id] || (elements[id] = makeEl(id)),
+  querySelector: () => null,
+  createElement: () => makeEl(),
+  addEventListener() {},
+};
+"""
+        + script
+        + """
+state.token = "tok";
+state.shellMounted = true;
+state.rows = [
+  { id: "a1b2c3d4-0001", kind: "raw", content: "[user]: hi", project: "/w/Temp", source: "agentica", session_id: "agentica:s_kcbe38ct", at: 1794486049, is_latest: true, deleted: false, supersedes: [], superseded_by: [], source_ids: [], procedure: null },
+  { id: "e5f6a7b8-0002", kind: "fact", content: "提交信息只写一行", project: "/w/memhub", source: "cursor", session_id: "cursor:ae808758", at: 1794486000, is_latest: true, deleted: false, supersedes: [], superseded_by: [], source_ids: [], procedure: null },
+  { id: "99887766-0003", kind: "profile", content: "偏好极简代码", project: "", source: "", session_id: "", at: 1794485000, is_latest: true, deleted: false, supersedes: [], superseded_by: [], source_ids: [], procedure: null },
+];
+state.byId = Object.fromEntries(state.rows.map(r => [r.id, r]));
+
+render(true);
+if (!elements.sidebar.innerHTML.includes("<h2>来源工具</h2>")) throw new Error("missing source header");
+if (!elements.sidebar.innerHTML.includes('data-source="agentica"')) throw new Error("missing agentica nav");
+if (!elements.sidebar.innerHTML.includes("手动/未标来源")) throw new Error("missing manual source label");
+
+// 1. Sidebar source filter
+state.source = "agentica";
+render(true);
+if (visible().length !== 1 || visible()[0].id !== "a1b2c3d4-0001") throw new Error("sidebar source filter failed");
+if (!elements.summary.innerHTML.includes("agentica")) throw new Error("summary missing source label");
+
+// 2. Text search matches source, session_id, and short memory id
+state.source = "*";
+state.text = "agentica";
+if (visible().length !== 1 || visible()[0].id !== "a1b2c3d4-0001") throw new Error("text search by source failed");
+
+state.text = "s_kcbe38ct";
+if (visible().length !== 1 || visible()[0].id !== "a1b2c3d4-0001") throw new Error("text search by session_id failed");
+
+state.text = "e5f6a7b8";
+if (visible().length !== 1 || visible()[0].id !== "e5f6a7b8-0002") throw new Error("text search by id failed");
+
+console.log("UI_SOURCE_FILTER_OK");
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(["node", str(harness)], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert "UI_SOURCE_FILTER_OK" in proc.stdout
+
+
+
 
 

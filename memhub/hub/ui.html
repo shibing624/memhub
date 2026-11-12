@@ -455,6 +455,7 @@ const state = {
   rows: [],
   byId: {},
   project: "*",
+  source: "*",
   kind: "*",
   text: "",
   history: false,
@@ -503,6 +504,7 @@ function toast(text) {
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const base = p => p ? p.replace(/\/+$/, "").split("/").pop() : "未归属项目";
+const srcName = s => s || "手动/未标来源";
 const day = t => t ? new Date(t * 1000).toLocaleString("zh-CN", { hour12: false }) : "";
 
 function title(row) {
@@ -526,20 +528,25 @@ function visible() {
   return state.rows.filter(r =>
     (state.history || r.is_latest) &&
     (state.project === "*" || r.project === state.project) &&
+    (state.source === "*" || r.source === state.source) &&
     (state.kind === "*" || r.kind === state.kind) &&
     (!state.hits || state.hits.has(r.id)) &&
-    (!text || (r.content + " " + r.project + " " + (r.procedure ? r.procedure.task + " " + r.procedure.solution : "")).toLowerCase().includes(text))
+    (!text || (
+      r.content + " " + r.project + " " + r.source + " " + r.session_id + " " + r.id + " " +
+      (r.procedure ? r.procedure.task + " " + r.procedure.solution : "")
+    ).toLowerCase().includes(text))
   );
 }
 
-function counts(key, rows) {
+function counts(key, rows, current = "*") {
   const out = {};
   for (const r of rows) out[r[key]] = (out[r[key]] || 0) + 1;
+  if (current !== "*" && !(current in out)) out[current] = 0;
   return Object.entries(out).sort((a, b) => b[1] - a[1]);
 }
 
 function nav(label, value, current, n, attr) {
-  return `<div class="nav ${value === current ? "on" : ""}" data-${attr}="${esc(value)}" title="${esc(value || "未归属项目")}">
+  return `<div class="nav ${value === current ? "on" : ""}" data-${attr}="${esc(value)}" title="${esc(value || label)}">
     <span class="nav-label">${esc(label)}</span><span class="cnt">${n}</span>
   </div>`;
 }
@@ -647,7 +654,7 @@ function mountShell() {
         <div class="bar">
           <div class="search-wrap">
             ${SEARCH_SVG}
-            <input type="search" id="q" placeholder="输入关键词即时筛选；按回车执行混合语义搜索">
+            <input type="search" id="q" placeholder="输入关键词、来源工具（如 agentica）或会话/记忆 ID 即时筛选；按回车语义搜索">
           </div>
           <span id="clear-slot"></span>
           <label class="chk"><input type="checkbox" id="hist"> 显示历史版本</label>
@@ -708,17 +715,22 @@ function updateCardInPlace(id) {
 
 function renderSidebar() {
   const scoped = state.rows.filter(r => state.history || r.is_latest);
+  const inSource = scoped.filter(r => state.source === "*" || r.source === state.source);
   const inProject = scoped.filter(r => state.project === "*" || r.project === state.project);
+  const inBoth = inProject.filter(r => state.source === "*" || r.source === state.source);
   const sidebar = document.getElementById("sidebar");
   const prevScroll = sidebar.scrollTop;
   sidebar.innerHTML = `
     <div class="brand">${LOGO_SVG}<span>memhub</span></div>
     <h2>项目</h2>
-    ${nav("全部", "*", state.project, scoped.length, "project")}
-    ${counts("project", scoped).map(([p, n]) => nav(base(p), p, state.project, n, "project")).join("")}
+    ${nav("全部", "*", state.project, inSource.length, "project")}
+    ${counts("project", inSource, state.project).map(([p, n]) => nav(base(p), p, state.project, n, "project")).join("")}
+    <h2>来源工具</h2>
+    ${nav("全部", "*", state.source, inProject.length, "source")}
+    ${counts("source", inProject, state.source).map(([s, n]) => nav(srcName(s), s, state.source, n, "source")).join("")}
     <h2>类型</h2>
-    ${nav("全部", "*", state.kind, inProject.length, "kind")}
-    ${counts("kind", inProject).map(([k, n]) => nav(KIND[k] || k, k, state.kind, n, "kind")).join("")}
+    ${nav("全部", "*", state.kind, inBoth.length, "kind")}
+    ${counts("kind", inBoth, state.kind).map(([k, n]) => nav(KIND[k] || k, k, state.kind, n, "kind")).join("")}
   `;
   sidebar.scrollTop = prevScroll;
 }
@@ -730,8 +742,9 @@ function renderContent(resetScroll) {
 
   const summary = document.getElementById("summary");
   const projLabel = state.project === "*" ? "全部项目" : base(state.project);
+  const srcLabel = state.source === "*" ? "全部来源" : srcName(state.source);
   const kindLabel = state.kind === "*" ? "全部类型" : (KIND[state.kind] || state.kind);
-  summary.innerHTML = `<span>${esc(projLabel)} · ${esc(kindLabel)} · 共 <b>${rows.length}</b> 条${state.hits ? `（语义搜索："${esc(state.semanticQuery)}"）` : ""}</span>`;
+  summary.innerHTML = `<span>${esc(projLabel)} · ${esc(srcLabel)} · ${esc(kindLabel)} · 共 <b>${rows.length}</b> 条${state.hits ? `（语义搜索："${esc(state.semanticQuery)}"）` : ""}</span>`;
 
   const mainEl = document.getElementById("main-scroll");
   const prevScroll = mainEl.scrollTop;
@@ -790,12 +803,16 @@ async function semantic(query) {
 }
 
 document.addEventListener("click", async e => {
-  const t = e.target.closest("[data-project],[data-kind],[data-toggle],[data-edit],[data-del],[data-save],[data-cancel],[data-reload],[data-clear]");
+  const t = e.target.closest("[data-project],[data-source],[data-kind],[data-toggle],[data-edit],[data-del],[data-save],[data-cancel],[data-reload],[data-clear]");
   if (!t) return;
   const d = t.dataset;
   try {
     if (d.project !== undefined) {
       state.project = d.project;
+      state.kind = "*";
+      render(true);
+    } else if (d.source !== undefined) {
+      state.source = d.source;
       state.kind = "*";
       render(true);
     } else if (d.kind !== undefined) {

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## [0.2.4] — 2026-11-12
+
+- **MemHub Web 管理界面（`/ui`）支持按「来源工具」侧边栏筛选与搜索框匹配 `source` / `session_id` / `id`**：
+  - `memhub/hub/ui.html` 左侧边栏新增 **来源工具** 分组（展示 `agentica`、`cursor`、`claude-code`、`codex`、`workbuddy` 等各宿主来源及手动写入计数，与项目、类型交叉联动），顶部摘要栏同步显示当前选中的来源；顶部搜索框同时支持按 `source`、`session_id`（如 `s_...` 或 `wechat`）及记忆短 `id` 即时过滤。
 - **修复 Agentica Web / Desktop / IM 对话未采集与注入记忆，并排除纯 SDK 会话**：
   - `AgenticaHooks.install` 在 `~/.agentica/config.yaml` 的 `memhub` consumer 条目上单独写入 `gateway: true`（不改顶层 `settings.hooks.gateway`，避免把 `open-island` 等只面向终端的消费者拖进网关；`hosts_status` / `memhub doctor` 同步校验 consumer 级 `gateway: true`），使共享同一网关进程的 Agentica Web、Desktop App 与 IM 渠道（微信、企微、飞书、QQ 等）同 CLI 一样自动触发 `UserPromptSubmit` 记忆召回与 `run.completed` / `session.ended` 结束采集。
   - `SOURCE_SPECS["agentica"]`、`scan_file` 与 `locate_transcript` 读取 `<session>.meta.json` 的结构化 `source` / `origin`，跳过 `sdk` / `subagent` 运行记录（只排除纯 SDK 调用，保留 CLI / Web / Desktop / IM 会话）；按 `session_id` 定位会话文件时转义 glob 特殊字符，并在跨目录或多账号存在同名文件（如 IM `agent:main:wechat:...` 或切换过工作目录的 `s_*` 会话）时优先匹配当前 `cwd` 与最新修改时间。
