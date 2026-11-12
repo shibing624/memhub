@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **修复长编码会话写入反复失败 `CodingDecisionError: coding extraction requires a {"candidates": [...]} object`**：根因不是输入超长，而是**输出**被截断。会话里可沉淀的工程经验多时，抽取回复写到 `max_tokens`（默认 4096，部分网关上限也是 4096）就被截断，残缺 JSON 解析为空，再按"空结果"重试仍被截断，最后报错；写入任务重试 9 次后进入 failed。现在 `LLMClient.chat_json` 识别 `finish_reason == "length"` 并抛 `LLMOutputTruncatedError`（不再把截断当空结果重试），procedure 抽取器收到后在最近的用户轮次处把对话一分为二，分别抽取再合并；用一条 329 条消息的真实失败会话验证，由失败变为 3 次调用产出 5 条 procedure。
+
 ## [0.2.4] — 2026-11-12
 
 - **MemHub Web 管理界面（`/ui`）支持按「来源工具」侧边栏筛选与搜索框匹配 `source` / `session_id` / `id`**：

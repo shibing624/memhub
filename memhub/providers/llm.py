@@ -33,6 +33,12 @@ DEFAULT_CHAT_JSON_MAX_TOKENS = 4096
 TRUNC_MARKER = "\n...[truncated]...\n"
 
 
+class LLMOutputTruncatedError(ValueError):
+    """The completion stopped at ``max_tokens`` (``finish_reason == "length"``) and the
+    cut-off text is not the JSON asked for. Retrying the same request cannot fit; the
+    caller must ask for less output (e.g. split the source)."""
+
+
 def truncate_middle(text: str, max_len: int) -> str:
     """Keep head and tail; drop the middle when ``text`` exceeds ``max_len``.
 
@@ -350,7 +356,8 @@ class LLMClient:
         json_object: bool | None,
         json_array: bool = False,
         max_tokens: int,
-    ) -> dict | list:
+    ) -> tuple[dict | list, bool]:
+        """The parsed reply, and whether the completion hit ``max_tokens``."""
         # json_array=True disables json_object mode (which only allows objects)
         use_json_mode = (
             False
@@ -385,11 +392,13 @@ class LLMClient:
             **self._completion_kwargs(**kwargs),
         )
         self._after_call("chat_json", resp, start)
-        content = resp.choices[0].message.content or ""
+        choice = resp.choices[0]
+        content = choice.message.content or ""
+        truncated = choice.finish_reason == "length"
         parsed = _parse_json(content)
         if json_array:
-            return parsed if isinstance(parsed, (dict, list)) else {}
-        return parsed if isinstance(parsed, dict) else {}
+            return (parsed if isinstance(parsed, (dict, list)) else {}), truncated
+        return (parsed if isinstance(parsed, dict) else {}), truncated
 
     async def chat_json(
         self,
@@ -402,8 +411,12 @@ class LLMClient:
         max_tokens: int = DEFAULT_CHAT_JSON_MAX_TOKENS,
         retries: int = 1,
     ) -> dict | list:
-        """Run a chat completion and parse the reply as JSON (single-shot, no chunking)."""
-        parsed = await self._chat_json_once(
+        """Run a chat completion and parse the reply as JSON (single-shot, no chunking).
+
+        Raises ``LLMOutputTruncatedError`` when the reply was cut at ``max_tokens``
+        and did not parse: the same request would be cut again.
+        """
+        parsed, truncated = await self._chat_json_once(
             system=system,
             user=user,
             temperature=temperature,
@@ -416,9 +429,9 @@ class LLMClient:
         # 注意：模型真吐空（无内容可归纳）也会重试一次，无害（多一次免费调用）。
         for _ in range(max(0, retries)):
             is_empty = parsed == {} or parsed == []
-            if not is_empty:
+            if not is_empty or truncated:
                 break
-            parsed = await self._chat_json_once(
+            parsed, truncated = await self._chat_json_once(
                 system=system,
                 user=user
                 + "\n\nImportant: reply with ONLY a valid JSON "
@@ -428,6 +441,10 @@ class LLMClient:
                 json_object=json_object,
                 json_array=json_array,
                 max_tokens=max_tokens,
+            )
+        if truncated and (parsed == {} or parsed == []):
+            raise LLMOutputTruncatedError(
+                f"chat_json reply cut at max_tokens={max_tokens} before the JSON closed"
             )
         return parsed
 
@@ -450,24 +467,26 @@ class LLMClient:
             or len(build_system(user_text)) + len(user_text) <= self.input_max_chars
         ):
             system = build_system(user_text)
-            return await self._chat_json_once(
+            parsed, _ = await self._chat_json_once(
                 system=system,
                 user=user_text,
                 temperature=temperature,
                 json_object=json_object,
                 max_tokens=max_tokens,
             )
+            return parsed
 
         chunks = chunk_text_for_llm(user_text, budget)
         if len(chunks) == 1:
             system = build_system(chunks[0])
-            return await self._chat_json_once(
+            parsed, _ = await self._chat_json_once(
                 system=system,
                 user=chunks[0],
                 temperature=temperature,
                 json_object=json_object,
                 max_tokens=max_tokens,
             )
+            return parsed
 
         logger.info(
             "chat_json_for_content chunked %d parts (budget=%d chars)",
@@ -477,15 +496,14 @@ class LLMClient:
         parts: list[dict] = []
         for chunk in chunks:
             system = build_system(chunk)
-            parts.append(
-                await self._chat_json_once(
-                    system=system,
-                    user=chunk,
-                    temperature=temperature,
-                    json_object=json_object,
-                    max_tokens=max_tokens,
-                )
+            parsed, _ = await self._chat_json_once(
+                system=system,
+                user=chunk,
+                temperature=temperature,
+                json_object=json_object,
+                max_tokens=max_tokens,
             )
+            parts.append(parsed)
         return merge_results(parts)
 
     async def _chat_text_once(

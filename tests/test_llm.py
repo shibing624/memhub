@@ -238,3 +238,29 @@ def test_chunk_text_for_llm_prefers_newlines():
     chunks = chunk_text_for_llm(text, 40)
     assert len(chunks) >= 2
     assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
+
+
+@respx.mock
+async def test_chat_json_raises_when_reply_is_cut_at_max_tokens():
+    """A reply stopped by ``max_tokens`` mid-JSON is not an empty answer: retrying the
+    same request is cut again, so it raises instead of returning ``{}``."""
+    from memhub.providers.llm import LLMOutputTruncatedError
+
+    route = respx.post("https://api.test/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                **_completion({"role": "assistant", "content": '{"candidates": [{"task": "a'}),
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": '{"candidates": [{"task": "a'},
+                        "finish_reason": "length",
+                    }
+                ],
+            },
+        )
+    )
+    with pytest.raises(LLMOutputTruncatedError):
+        await _make_client().chat_json(system="s", user="u", max_tokens=16)
+    assert route.call_count == 1

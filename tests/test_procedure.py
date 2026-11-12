@@ -723,3 +723,39 @@ async def test_reconcile_bounds_selected_material_above_candidate_limit_and_fits
             assert len(offered) <= 6
             assert {"h-22", "h-24"} <= offered
 
+
+
+@respx.mock
+async def test_extractor_splits_the_source_when_the_reply_is_cut_at_max_tokens():
+    """A session with more procedures than one reply can hold: the cut-off reply is
+    not an extraction error, the dialogue is halved at a user turn and each half is
+    extracted on its own."""
+    dialogue = [
+        {"role": "user", "content": "修复会话同步频率"},
+        {"role": "assistant", "content": "已改为 30 秒轮询"},
+        {"role": "user", "content": "旧会话上下文显示 0%"},
+        {"role": "assistant", "content": "用 usage 回填修复"},
+    ]
+    seen: list[list[dict]] = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        # JSON mode appends "Reply with json." on its own line after the source.
+        source = json.loads(json.loads(request.content)["messages"][1]["content"].split("\n")[0])
+        seen.append(source)
+        if len(source) == len(dialogue):
+            choice = {"message": {"role": "assistant", "content": '{"candidates": [{"ta'},
+                      "finish_reason": "length"}
+        else:
+            cand = dict(CANDIDATE, task=source[0]["content"])
+            choice = {"message": {"role": "assistant", "content": json.dumps({"candidates": [cand]})},
+                      "finish_reason": "stop"}
+        return httpx.Response(200, json={"id": "1", "object": "chat.completion", "created": 0,
+                                         "model": "m", "choices": [{"index": 0, **choice}]})
+
+    respx.post("https://api.test/v1/chat/completions").mock(side_effect=reply)
+    llm = LLMClient(base_url="https://api.test/v1", api_key="k", model="m")
+    drafts = await CodingMemoryExtractor(llm=llm).extract(dialogue, files=[])
+    assert [len(s) for s in seen] == [4, 2, 2]
+    assert [s[0]["content"] for s in seen[1:]] == ["修复会话同步频率", "旧会话上下文显示 0%"]
+    assert [d.task for d in drafts] == ["修复会话同步频率", "旧会话上下文显示 0%"]
+    await llm.aclose()

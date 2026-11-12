@@ -9,7 +9,7 @@ from memhub.coding.types import (
     CodingDecisionError,
     CodingMemoryDraft,
 )
-from memhub.providers.llm import LLMClient
+from memhub.providers.llm import LLMClient, LLMOutputTruncatedError
 
 _EXTRACT_PROMPT = """Generate candidate procedure memories from the source JSON.
 The source is a coding session between a user and a coding agent: the user's
@@ -46,6 +46,11 @@ Output a JSON object {"candidates": [...]}, each candidate an object with:
 Return an empty candidates array when the source contains only ephemeral edits or no durable engineering knowledge.
 """
 
+# A long session can hold more procedures than one completion's ``max_tokens``
+# can write out; the source is then halved and each half extracted on its own,
+# down to this many messages.
+_MIN_SPLIT_MESSAGES = 2
+
 
 class CodingMemoryExtractor:
     def __init__(self, *, llm: LLMClient) -> None:
@@ -60,18 +65,7 @@ class CodingMemoryExtractor:
         branch: str | None = None,
         session_id: str = "",
     ) -> list[CodingMemoryDraft]:
-        # An object envelope, not a bare array: JSON mode (llm_json_mode, on by
-        # default) only admits objects, and the parser drops anything else.
-        data = await self.llm.chat_json(
-            system=_EXTRACT_PROMPT,
-            user=json.dumps(messages, ensure_ascii=False),
-            temperature=0.1,
-        )
-        items = data.get("candidates") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            raise CodingDecisionError(
-                'coding extraction requires a {"candidates": [...]} object'
-            )
+        items = await self._candidates(messages)
         drafts: list[CodingMemoryDraft] = []
         for item in items:
             if not isinstance(item, dict):
@@ -109,6 +103,36 @@ class CodingMemoryExtractor:
                 )
             )
         return drafts
+
+    async def _candidates(self, messages: list[dict]) -> list:
+        # An object envelope, not a bare array: JSON mode (llm_json_mode, on by
+        # default) only admits objects, and the parser drops anything else.
+        try:
+            data = await self.llm.chat_json(
+                system=_EXTRACT_PROMPT,
+                user=json.dumps(messages, ensure_ascii=False),
+                temperature=0.1,
+            )
+        except LLMOutputTruncatedError:
+            if len(messages) < 2 * _MIN_SPLIT_MESSAGES:
+                raise CodingDecisionError(
+                    "coding extraction output exceeds max_tokens even for "
+                    f"{len(messages)} messages"
+                ) from None
+            # Cut before a user message so no request is parted from its answer.
+            half = len(messages) // 2
+            starts = [i for i, m in enumerate(messages) if i and m.get("role") == "user"]
+            mid = min(starts, key=lambda i: abs(i - half)) if starts else half
+            return [
+                *await self._candidates(messages[:mid]),
+                *await self._candidates(messages[mid:]),
+            ]
+        items = data.get("candidates") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise CodingDecisionError(
+                'coding extraction requires a {"candidates": [...]} object'
+            )
+        return items
 
     @staticmethod
     def _text(item: dict[str, Any], name: str, *, required: bool = False) -> str:
