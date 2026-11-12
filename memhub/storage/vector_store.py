@@ -17,6 +17,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Iterator
 
 import chromadb
@@ -106,6 +107,32 @@ def merge_metadata(current: dict, incoming: dict) -> dict:
     return merged
 
 
+class _CountingCollection:
+    """The Chroma collection, with every mutating call reported to ``on_write``.
+
+    All writes of the store go through ``self.collection``; counting here covers
+    each of them (local writes, replication, snapshots, plan recovery) at one place.
+    """
+
+    _WRITES = frozenset({"add", "upsert", "update", "delete"})
+
+    def __init__(self, collection: Any, on_write: Callable[[], None]) -> None:
+        self._collection = collection
+        self._on_write = on_write
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._collection, name)
+        if name not in self._WRITES:
+            return attr
+
+        def write(*args: Any, **kwargs: Any) -> Any:
+            out = attr(*args, **kwargs)
+            self._on_write()
+            return out
+
+        return write
+
+
 def _normalize_where(where: dict | None) -> dict | None:
     """Wrap a multi-key where-filter in Chroma's $and form; pass single keys through."""
     if not where:
@@ -144,6 +171,12 @@ def _plan_semantic(nodes: list[MemoryNode]) -> list[dict]:
 
 class VectorStore(ABC):
     """Abstract interface for embedding-backed memory storage."""
+
+    @property
+    @abstractmethod
+    def generation(self) -> int:
+        """Changes whenever any node of this store is written, patched or removed
+        (local or replicated). A cache keyed on it never serves a stale read."""
 
     @abstractmethod
     def upsert(self, nodes: list[MemoryNode]) -> None: ...
@@ -233,9 +266,12 @@ class ChromaVectorStore(VectorStore):
             path=f"{storage_dir}/chroma",
             settings=Settings(anonymized_telemetry=False),
         )
-        self.collection = self.client.get_or_create_collection(
-            name=_COLLECTION,
-            metadata={"hnsw:space": "cosine", "hnsw:num_threads": 4},
+        self.collection = _CountingCollection(
+            self.client.get_or_create_collection(
+                name=_COLLECTION,
+                metadata={"hnsw:space": "cosine", "hnsw:num_threads": 4},
+            ),
+            self._bump_generation,
         )
 
         try:
@@ -948,6 +984,23 @@ class ChromaVectorStore(VectorStore):
             self._journal.execute(
                 "UPDATE plans SET done=1, payload=? WHERE id=?",
                 (json.dumps(_without_vectors(payload)), plan_id),
+            )
+
+    @property
+    def generation(self) -> int:
+        # Kept in the shared journal, not in this process: another process writing
+        # the same store (CLI next to the Core) must invalidate this one's caches.
+        with self._lock:
+            row = self._journal.execute(
+                "SELECT value FROM meta WHERE key='generation'"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def _bump_generation(self) -> None:
+        with self._lock, self._journal:
+            self._journal.execute(
+                "INSERT INTO meta(key,value) VALUES ('generation','1') "
+                "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1"
             )
 
     def scope_epoch(self, scope: tuple[str, str, str]) -> int:

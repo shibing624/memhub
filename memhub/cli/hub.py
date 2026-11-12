@@ -70,6 +70,8 @@ PROCEDURE_FULL_SCORE = 0.40
 MAX_FULL_PROCEDURES = 2
 HUB_INJECT_MAX_CHARS = 3000
 HUB_INJECT_MAX_LINES = 120
+# A prompt hook waits for recall before every turn; past this it is felt.
+RECALL_WARN_SECONDS = 3.0
 
 
 def make_client(hub_dir: str | None) -> HubClient:
@@ -1177,6 +1179,29 @@ def run_doctor(hub_dir: str | Path | None = None) -> dict[str, Any]:
                 "detail": (
                     f"done={writes.get('done', 0)}, "
                     f"pending={writes.get('pending', 0)}, failed=0"
+                ),
+                "required": False,
+            }
+        )
+
+    # 3b. Store size and recall latency: recall reads more as the store grows.
+    if remote_status is not None:
+        current = int((remote_status.get("memories") or {}).get("current", 0))
+        last = remote_status.get("recall")
+        slow = last is not None and last["seconds"] > RECALL_WARN_SECONDS
+        checks.append(
+            {
+                "name": "Recall latency",
+                "status": "warn" if slow else "ok",
+                "detail": (
+                    f"{current} current memories; last recall "
+                    + (f"{last['seconds']:.2f}s" if last is not None else "not yet run")
+                    + (
+                        f" (> {RECALL_WARN_SECONDS:g}s: the store has outgrown the "
+                        "recall path, report it with this count)"
+                        if slow
+                        else ""
+                    )
                 ),
                 "required": False,
             }

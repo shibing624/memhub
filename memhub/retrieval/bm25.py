@@ -57,6 +57,43 @@ def compute_bm25_scores(
     return scores
 
 
+
+class LexicalIndex:
+    """An inverted index of a fixed corpus, scored with the same BM25+ as
+    ``compute_bm25_scores`` over the whole corpus.
+
+    Building it tokenizes every document once; a query then touches only the
+    documents that contain one of its terms instead of rescoring the corpus.
+    """
+
+    def __init__(self, documents: list[str], k1: float = BM25_K1, b: float = BM25_B) -> None:
+        self.k1, self.b = k1, b
+        self.n = len(documents)
+        self.doc_lens: list[int] = []
+        self.postings: dict[str, list[tuple[int, int]]] = {}
+        for i, text in enumerate(documents):
+            counts = Counter(tokenize(text))
+            self.doc_lens.append(sum(counts.values()))
+            for term, tf in counts.items():
+                self.postings.setdefault(term, []).append((i, tf))
+        self.avgdl = (sum(self.doc_lens) / self.n) if self.n else 1.0
+        self.avgdl = self.avgdl or 1.0
+
+    def scores(self, query_terms: list[str]) -> dict[int, float]:
+        """Document index -> score, for every document sharing a query term."""
+        out: dict[int, float] = {}
+        for t in {t for t in query_terms if t}:
+            posting = self.postings.get(t)
+            if not posting:
+                continue
+            df = len(posting)
+            idf = math.log((self.n - df + 0.5) / (df + 0.5) + 1.0)
+            for i, tf in posting:
+                dl = self.doc_lens[i] or 1
+                denom = tf + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+                out[i] = out.get(i, 0.0) + idf * (tf * (self.k1 + 1)) / denom
+        return out
+
 def compute_bm25_confidences(
     query_terms: list[str],
     candidate_contents: list[str],

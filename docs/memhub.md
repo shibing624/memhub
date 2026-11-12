@@ -163,7 +163,7 @@ memhub connect git git@github.com:<你的用户名>/my-vibecoding-memory.git
 | 只导入某个工具的历史 | `memhub scan --source codex` |
 | 快速导入、稍后再整理 | `memhub scan --source all --raw-only`，之后 `memhub extract` |
 | 按 L0 来源短 ID 展开完整原话与前后上下文 | `memhub recall --source-id 37c85fe9` |
-| 诊断配置、Core、写入队列、同步与宿主接入状态 | `memhub doctor` |
+| 诊断配置、Core、写入队列、召回耗时、同步与宿主接入状态 | `memhub doctor` |
 | 重试失败的整理任务 | `memhub retry` |
 | 立刻跨设备同步一次 | `memhub sync` |
 | 查看、搜索、编辑、删除记忆 | `memhub ui` |

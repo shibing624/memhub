@@ -9,15 +9,18 @@ both routes use the same semantic/BM25 scoring scale. profile = L2 (VDB) + L3
 routes to normal; intentions to proactive when intention_limit > 0.
 """
 import asyncio
+import json
 import logging
 import math
 import re
+import weakref
 from dataclasses import replace
 
 from memhub.coding.types import PROCEDURE_KIND, procedure_detail
 from memhub.isolation import build_filter
 from memhub.registry import ComponentFactory
 from memhub.retrieval.bm25 import (
+    LexicalIndex,
     compute_bm25_confidences,
     compute_bm25_scores,
     tokenize,
@@ -117,21 +120,48 @@ def _lexical_candidates(
 ) -> list[MemoryNode]:
     """Best BM25 matches over every current memory of the scope not already recalled.
 
-    Memory scopes are per user (a few hundred to a few thousand nodes), so scoring them
-    in one pass is cheap and needs no index. Only nodes sharing a query term are
-    returned, best first.
+    The scope's corpus is read and indexed once per store generation (see
+    ``_LexicalCache``), so a recall scores only the memories sharing a query term
+    instead of reading and tokenizing the whole scope. Best first.
     """
-    nodes = [n for n in vector.get_many(where, limit=20_000) if _valid_at(n, as_of)]
+    nodes, index = _LEXICAL_CACHE.get(vector, where)
     if not nodes:
         return []
-    scores = compute_bm25_scores(
-        terms, [f"{n.content} {' '.join(n.tags)}".strip() for n in nodes]
-    )
-    ranked = sorted(zip(nodes, scores), key=lambda pair: pair[1], reverse=True)
+    ranked = sorted(index.scores(terms).items(), key=lambda pair: pair[1], reverse=True)
+    # Copies: callers set ``score`` on what they get, and the cached corpus is shared.
     return [
-        node for node, score in ranked
-        if score > 0 and node.node_id not in excluded
+        replace(nodes[i]) for i, score in ranked
+        if score > 0 and nodes[i].node_id not in excluded and _valid_at(nodes[i], as_of)
     ][:limit]
+
+
+class _LexicalCache:
+    """The lexical corpus of a scope filter, rebuilt when the store's write
+    generation changes. A few recall filters are live at once (normal / profile /
+    conversation, per project session scope), so only the most recent are kept.
+    Entries hang off the store object itself (weakly), so two stores in one process
+    never share an entry and a closed store's corpus goes with it."""
+
+    def __init__(self, max_entries: int = 16) -> None:
+        self.max_entries = max_entries
+        self._stores: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+    def get(self, vector, where: dict) -> tuple[list[MemoryNode], LexicalIndex]:
+        entries = self._stores.setdefault(vector, {})
+        key = json.dumps(where, sort_keys=True, default=str)
+        generation = vector.generation
+        hit = entries.pop(key, None)
+        if hit is None or hit[0] != generation:
+            nodes = vector.get_many(where, limit=None)
+            index = LexicalIndex([f"{n.content} {' '.join(n.tags)}".strip() for n in nodes])
+            hit = (generation, nodes, index)
+        entries[key] = hit  # most recently used last
+        while len(entries) > self.max_entries:
+            entries.pop(next(iter(entries)))
+        return hit[1], hit[2]
+
+
+_LEXICAL_CACHE = _LexicalCache()
 
 
 def _cosine_score(query: list[float], embedding: list[float] | None) -> float:

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **召回不再每次全量读库**：BM25 词法召回改为按记忆域建倒排索引（`LexicalIndex`，打分与原全量 BM25+ 逐位一致），项目视图按 workspace 缓存；两者都以记忆库的写入计数（`generation`，存在共享 journal 里，本地写、跨设备同步、其他进程写入都会递增）为失效键，写入后下一次召回即可见。本机 5.6k 条记忆实测，稳态召回 0.70s → 0.17s。
+- **`memhub doctor` 新增 `Recall latency` 检查项**：报告当前记忆条数和最近一次召回耗时，超过 3s 告警；`/v1/hub/status` 新增 `recall` 字段。
 - **修复长编码会话写入反复失败 `CodingDecisionError: coding extraction requires a {"candidates": [...]} object`**：根因不是输入超长，而是**输出**被截断。会话里可沉淀的工程经验多时，抽取回复写到 `max_tokens`（默认 4096，部分网关上限也是 4096）就被截断，残缺 JSON 解析为空，再按"空结果"重试仍被截断，最后报错；写入任务重试 9 次后进入 failed。现在 `LLMClient.chat_json` 识别 `finish_reason == "length"` 并抛 `LLMOutputTruncatedError`（不再把截断当空结果重试），procedure 抽取器收到后在最近的用户轮次处把对话一分为二，分别抽取再合并；用一条 329 条消息的真实失败会话验证，由失败变为 3 次调用产出 5 条 procedure。
 - **修复同一会话在 JEV 判定阶段报 `coding source and drafts exceed the Jev context budget`**：每条 procedure 草稿都带着整个会话的文件列表（上述会话 103 个路径），5 条草稿光路径就占约 32K 字符，叠加 22K 源对话超过 60K 预算。文件列表只用于检索、不参与判定，现在送进 JEV 的每条草稿只带前 8 个路径（落库的 procedure 仍保留全部路径），该会话判定状态从约 70K 降到约 41K。
 

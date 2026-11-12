@@ -318,6 +318,36 @@ def project_sessions(client: MemoryClient, workspace: str) -> list[str]:
     return sessions
 
 
+class ProjectViewCache:
+    """``project_sessions_and_view`` per workspace, reused until the store changes.
+
+    Every recall of a coding host asks for it, and building it reads every raw
+    dialogue and procedure of the store: the cost grows with the store. The key is
+    the store's write generation, so any write (local, replicated, from another
+    process) rebuilds it. ``max_age`` bounds the inputs the generation does not
+    see: validity windows passing with the clock, and a checkout's git layout.
+    """
+
+    def __init__(self, *, max_age: float = 300.0, max_entries: int = 64) -> None:
+        self.max_age = max_age
+        self.max_entries = max_entries
+        self._entries: dict[str, tuple[int, float, tuple[list[str], dict | None]]] = {}
+
+    def get(
+        self, client: MemoryClient, workspace: str
+    ) -> tuple[list[str], dict[str, Any] | None]:
+        generation = client.factory.vector.generation
+        hit = self._entries.get(workspace)
+        now = time.monotonic()
+        if hit is not None and hit[0] == generation and now - hit[1] < self.max_age:
+            return hit[2]
+        value = project_sessions_and_view(client, workspace)
+        if len(self._entries) >= self.max_entries:
+            self._entries.pop(min(self._entries, key=lambda k: self._entries[k][1]))
+        self._entries[workspace] = (generation, now, value)
+        return value
+
+
 def create_hub_app(
     *,
     api_key: str | None = None,
@@ -359,6 +389,7 @@ def create_hub_app(
         queue: HubWriteQueue | None = None
         syncer: HubSyncer | None = None
         app.state.syncer = None
+        app.state.last_recall = None
         try:
             resolved_key = load_or_create_runtime_token(root, token=api_key)
             app.state.api_key = resolved_key
@@ -372,6 +403,7 @@ def create_hub_app(
                 settings=settings or hub_settings(root)
             )
             app.state.client = core_client
+            app.state.project_views = ProjectViewCache()
 
             async def configure_sync(cfg: SyncConfig | None, backend=None) -> None:
                 """(Re)start replication for ``cfg``; None stops it."""
@@ -696,6 +728,7 @@ def create_hub_app(
     @app.post("/v1/hub/recall", dependencies=[Depends(verify)])
     async def recall(body: HubRecallRequest):
         core_client: MemoryClient = app.state.client
+        started = time.perf_counter()
         if app.state.syncer is not None:
             # Answer from the local store now; newer memories arrive for the next one.
             app.state.syncer.pull_if_stale()
@@ -705,7 +738,7 @@ def create_hub_app(
         project_view: dict[str, Any] | None = None
         if body.workspace:
             sessions, project_view = await asyncio.to_thread(
-                project_sessions_and_view, core_client, body.workspace
+                app.state.project_views.get, core_client, body.workspace
             )
         scope = sessions or None
         if body.limit > 0 or body.procedure_limit > 0:
@@ -798,6 +831,10 @@ def create_hub_app(
         warnings = health_warnings()
         if warnings:
             out["warnings"] = warnings
+        app.state.last_recall = {
+            "at": int(time.time()),
+            "seconds": round(time.perf_counter() - started, 3),
+        }
         return out
 
     def embed_identity() -> dict[str, Any]:
@@ -994,6 +1031,7 @@ def create_hub_app(
                 "last_error": app.state.queue.last_idle_error,
             },
             "sync": app.state.syncer.status() if app.state.syncer is not None else None,
+            "recall": app.state.last_recall,
         }
 
     return app
