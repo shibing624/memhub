@@ -759,3 +759,24 @@ async def test_extractor_splits_the_source_when_the_reply_is_cut_at_max_tokens()
     assert [s[0]["content"] for s in seen[1:]] == ["修复会话同步频率", "旧会话上下文显示 0%"]
     assert [d.task for d in drafts] == ["修复会话同步频率", "旧会话上下文显示 0%"]
     await llm.aclose()
+
+
+async def test_reconcile_keeps_a_long_session_file_list_out_of_the_judge_budget() -> None:
+    """Every draft carries the session's whole file list; five drafts from a session
+    that touched 100 files used to exceed the Jev budget on paths alone."""
+    files = [f"/repo/packages/module_{i:03d}/src/component_file_{i:03d}.tsx" for i in range(100)]
+    drafts = [
+        CodingMemoryDraft(task=f"task {i}", solution="s" * 300, files=files, workspace_id="/repo")
+        for i in range(5)
+    ]
+    jev = FakeJev()
+    ops = await CodingMemoryReconciler(jev=jev).reconcile(
+        drafts,
+        [],
+        source_messages=[{"role": "user", "content": "x" * 22_000}],
+        max_state_chars=60_000,
+    )
+    assert len(ops) == 5
+    assert all(len(d["files"]) == 8 for d in jev.calls[0]["state"]["drafts"])
+    # The drafts themselves keep every path for the stored procedure.
+    assert all(len(d.files) == 100 for d in drafts)

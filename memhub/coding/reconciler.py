@@ -47,6 +47,10 @@ _NEEDS_TARGET = set(_WITH_TARGET) - {"ADD_SUPPLEMENT", "INVALID", "NEED_CONTEXT"
 # Room the questions and the envelope take next to the state.
 _QUESTION_OVERHEAD = 4_000
 _OPTION_CHARS = 240
+# Every draft of a write carries the same session file list (a long session names
+# ~100 paths). It is metadata for retrieval, not material for any decision, so the
+# judge sees it once per draft only up to this many paths.
+_JUDGE_FILES = 8
 
 
 def _size(state: dict, overhead: int = _QUESTION_OVERHEAD) -> int:
@@ -129,7 +133,9 @@ class CodingMemoryReconciler:
             # Same as the chat path: no candidates keeps the source RAW_ONLY without
             # spending a model call on whether the extractor missed something.
             return []
-        proposals = [dict(d.to_dict(), id=i) for i, d in enumerate(drafts)]
+        proposals = [
+            dict(d.to_dict(), id=i, files=d.files[:_JUDGE_FILES]) for i, d in enumerate(drafts)
+        ]
         if _size({"source": source_messages, "drafts": proposals}) > max_state_chars:
             drafts_chars = _size({"source": [], "drafts": proposals})
             if drafts_chars <= max_state_chars:
