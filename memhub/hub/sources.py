@@ -38,6 +38,7 @@ the host records become the procedure's version boundary.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import io
 import json
@@ -1124,12 +1125,57 @@ class SourceSpec:
     read: Callable[[Path, int], tuple[list[Message], int]]
 
 
-def _jsonl_files(pattern: str, *, inside: str | None = None) -> Callable[[Path], list[Path]]:
+_AGENTICA_EXCLUDED_SOURCES = frozenset({"sdk", "subagent"})
+
+
+def _is_agentica_excluded(path: Path) -> bool:
+    """True when ``<session>.meta.json`` marks the transcript as SDK or subagent.
+
+    CLI, Web, Desktop, and IM transcripts (``cli``, ``gateway``, channel names, or
+    legacy transcripts without a sidecar) belong to the user and are ingested.
+    """
+    meta_path = path.with_name(f"{path.stem}.meta.json")
+    if not meta_path.is_file():
+        return False
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    src = str(data.get("source") or "").strip().lower()
+    if src:
+        return src in _AGENTICA_EXCLUDED_SOURCES
+    origin = str(data.get("origin") or "").strip().lower()
+    return origin in _AGENTICA_EXCLUDED_SOURCES
+
+
+def _agentica_project_workspace(path: Path) -> str:
+    proj_file = path.parent / "project.json"
+    if not proj_file.is_file():
+        return ""
+    try:
+        data = json.loads(proj_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return canonical_workspace(data.get("work_dir"))
+
+
+def _jsonl_files(
+    pattern: str,
+    *,
+    inside: str | None = None,
+    exclude: Callable[[Path], bool] | None = None,
+) -> Callable[[Path], list[Path]]:
     def discover(root: Path) -> list[Path]:
         files = [
             p
             for p in root.rglob(pattern)
-            if "subagents" not in p.parts and (inside is None or inside in p.parts)
+            if "subagents" not in p.parts
+            and (inside is None or inside in p.parts)
+            and (exclude is None or not exclude(p))
         ]
         return sorted(files, key=lambda p: p.stat().st_mtime_ns)
 
@@ -1140,7 +1186,7 @@ SOURCE_SPECS: dict[str, SourceSpec] = {
     "agentica": SourceSpec(
         "agentica",
         ".agentica/projects",
-        _jsonl_files("*.jsonl"),
+        _jsonl_files("*.jsonl", exclude=_is_agentica_excluded),
         lambda p, s: _read_jsonl(p, s, _parse_agentica),
     ),
     "claude-code": SourceSpec(
@@ -1341,6 +1387,8 @@ async def scan_file(
     unmoved: a half-written file parses on a later scan.
     """
     spec = SOURCE_SPECS[source]
+    if source == "agentica" and _is_agentica_excluded(path):
+        return 0
     key = str(path.resolve())
     with cursors.lock(source, key):
         cursor = cursors.get(source, key)
@@ -1452,7 +1500,10 @@ def locate_transcript(
     ``session_id``; Cursor names the conversation ``conversation_id``.
     """
     if payload.get("transcript_path") or payload.get("transcriptPath"):
-        return Path(payload.get("transcript_path") or payload["transcriptPath"]).expanduser()
+        target = Path(payload.get("transcript_path") or payload["transcriptPath"]).expanduser()
+        if source == "agentica" and _is_agentica_excluded(target):
+            return None
+        return target
     root = (roots or default_source_roots())[source]
     if source in ("hermes", "opencode", "zcode"):
         return root if root.is_file() else None
@@ -1463,18 +1514,38 @@ def locate_transcript(
     )
     if not session_id or not root.is_dir():
         return None
+    escaped = glob.escape(str(session_id))
     if source == "cline":
-        return next(root.glob(f"{session_id}/{session_id}.messages.json"), None)
+        return next(root.glob(f"{escaped}/{escaped}.messages.json"), None)
     if source == "copilot":
-        return next(root.glob(f"{session_id}/events.jsonl"), None)
+        return next(root.glob(f"{escaped}/events.jsonl"), None)
     if source == "kimi-cli":
-        return next(root.glob(f"*/{session_id}/context.jsonl"), None)
+        return next(root.glob(f"*/{escaped}/context.jsonl"), None)
     if source == "kimi-code":
-        return next(root.glob(f"*/{session_id}/agents/main/wire.jsonl"), None)
+        return next(root.glob(f"*/{escaped}/agents/main/wire.jsonl"), None)
     if source == "kiro":
-        return next(root.rglob(f"{session_id}/messages.jsonl"), None)
+        return next(root.rglob(f"{escaped}/messages.jsonl"), None)
     if source == "openclaw":
-        return next(root.glob(f"*/sessions/{session_id}*.jsonl"), None)
+        return next(root.glob(f"*/sessions/{escaped}*.jsonl"), None)
     if source == "pi":
-        return next(root.rglob(f"*_{session_id}.jsonl"), None)
-    return next(root.rglob(f"{session_id}.jsonl"), None)
+        return next(root.rglob(f"*_{escaped}.jsonl"), None)
+    candidates = [
+        p
+        for p in root.rglob(f"{escaped}.jsonl")
+        if "subagents" not in p.parts
+        and (source != "agentica" or not _is_agentica_excluded(p))
+    ]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    wanted_ws = canonical_workspace(payload.get("cwd"))
+    return max(
+        candidates,
+        key=lambda p: (
+            bool(wanted_ws and _agentica_project_workspace(p) == wanted_ws)
+            if source == "agentica"
+            else False,
+            p.stat().st_mtime_ns,
+        ),
+    )

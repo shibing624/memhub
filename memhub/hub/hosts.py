@@ -253,7 +253,9 @@ class TomlMcp:
 
 class AgenticaHooks:
     """``settings.hooks.consumers`` in ~/.agentica/config.yaml: one consumer that
-    recalls on ``UserPromptSubmit`` and captures on run end.
+    recalls on ``UserPromptSubmit`` and captures on run end across CLI and Gateway
+    (Web, Desktop, IM), scoped with per-consumer ``gateway: true`` so terminal-only
+    consumers like ``open-island`` stay unaffected.
 
     Every event is listed: agentica turns an unlisted one on. Ours are found by
     ``HOOK_SIGNATURE`` in the command, so a consumer from an older install is
@@ -273,6 +275,7 @@ class AgenticaHooks:
             {
                 "name": AGENTICA_CONSUMER,
                 "command": launch.hook(),
+                "gateway": True,
                 "events": {e: e in AGENTICA_HOOK_EVENTS for e in AGENTICA_EVENTS},
             }
         )
@@ -292,7 +295,13 @@ class AgenticaHooks:
 
     def installed(self, path: Path) -> bool:
         hooks = (_load_yaml(path).get("settings") or {}).get("hooks") or {}
-        return any(self._ours(c) for c in hooks.get("consumers") or [])
+        if not hooks.get("enabled"):
+            return False
+        top_gw = bool(hooks.get("gateway"))
+        return any(
+            self._ours(c) and bool(c.get("gateway", top_gw))
+            for c in hooks.get("consumers") or []
+        )
 
 
 class ClaudeStyleHooks:

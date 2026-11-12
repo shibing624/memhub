@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **修复 Agentica Web / Desktop / IM 对话未采集与注入记忆，并排除纯 SDK 会话**：
+  - `AgenticaHooks.install` 在 `~/.agentica/config.yaml` 的 `memhub` consumer 条目上单独写入 `gateway: true`（不改顶层 `settings.hooks.gateway`，避免把 `open-island` 等只面向终端的消费者拖进网关；`hosts_status` / `memhub doctor` 同步校验 consumer 级 `gateway: true`），使共享同一网关进程的 Agentica Web、Desktop App 与 IM 渠道（微信、企微、飞书、QQ 等）同 CLI 一样自动触发 `UserPromptSubmit` 记忆召回与 `run.completed` / `session.ended` 结束采集。
+  - `SOURCE_SPECS["agentica"]`、`scan_file` 与 `locate_transcript` 读取 `<session>.meta.json` 的结构化 `source` / `origin`，跳过 `sdk` / `subagent` 运行记录（只排除纯 SDK 调用，保留 CLI / Web / Desktop / IM 会话）；按 `session_id` 定位会话文件时转义 glob 特殊字符，并在跨目录或多账号存在同名文件（如 IM `agent:main:wechat:...` 或切换过工作目录的 `s_*` 会话）时优先匹配当前 `cwd` 与最新修改时间。
 - **修复项目视图、注入预算与 `memory_get` 的隔离和保留错误**：
   - `GET /v1/hub/memories/{memory_id}` 的完整 ID 与 `>=8` 位短前缀共用同一范围：本 Hub、`user_id=default`、`agent_id=""`、非 `L0_RAW`。此前完整 ID 不校验 `agent_id`，能读到同一库里其他 agent 的记忆。
   - 项目视图先认节点自己的 workspace，再认 `L0` 来源边界；两者都没有时才用 session 兜底。同一 session 先写项目 A 再写项目 B 时，查 A 不再带出 B 的规矩和 procedure。

@@ -1202,11 +1202,13 @@ def test_install_uninstall_hosts_use_local_proxy(tmp_path: Path, monkeypatch) ->
     assert "{" not in skill.split("---", 2)[2]
     assert "`claude-code`" in skill
 
-    for key in ("ENABLED", "CONSUMERS"):
+    for key in ("ENABLED", "GATEWAY", "CONSUMERS"):
         monkeypatch.delenv(f"AGENTICA_HOOKS_{key}", raising=False)
     hooks = load_shell_hooks_config(
         yaml.safe_load((home / ".agentica" / "config.yaml").read_text())
     )
+    assert hooks.gateway is False
+    assert [item.name for item in hooks.for_gateway().consumers] == ["memhub"]
     assert [item.name for item in hooks.consumers_for("run.completed")] == [
         "open-island",
         "memhub",
@@ -3649,6 +3651,121 @@ def test_dsh_mcp_migrates_legacy_manager_and_bare_entry_to_insert_row(
     assert [row["id"] for item in after if "insert" in item for row in item["insert"]] == [
         "mcp-github"
     ]
+
+
+async def test_agentica_gateway_web_desktop_im_capture_and_sdk_exclusion(
+    tmp_path: Path,
+) -> None:
+    """Agentica CLI, Web, Desktop, and IM enable hooks and ingest transcripts;
+    pure SDK transcripts (``meta.json`` ``source: "sdk"``) are excluded."""
+    hub = tmp_path / "hub"
+    home = tmp_path / "home"
+    cfg_path = home / ".agentica" / "config.yaml"
+    cfg_path.parent.mkdir(parents=True)
+    # Legacy install without ``gateway: true`` is flagged until upgraded.
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "settings": {
+                    "hooks": {
+                        "enabled": True,
+                        "consumers": [
+                            {
+                                "name": "memhub",
+                                "command": [sys.executable, "-m", "memhub.cli", "hook", "agentica"],
+                            }
+                        ],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert hosts_status(home=home)["agentica"]["hooks"] is False
+
+    install_host("agentica", hub_dir=hub, home=home)
+    assert hosts_status(home=home)["agentica"]["hooks"] is True
+    loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert "gateway" not in loaded["settings"]["hooks"]
+    assert loaded["settings"]["hooks"]["consumers"][0]["gateway"] is True
+
+    roots = default_source_roots(home)
+    ag_root = roots["agentica"]
+
+    def write_session(
+        rel_dir: str,
+        session_id: str,
+        user_msg: str,
+        asst_msg: str,
+        *,
+        source: str | None,
+        work_dir: str = "/w/app",
+        mtime: int = 1_794_400_000,
+    ) -> Path:
+        proj_dir = ag_root / rel_dir
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        (proj_dir / "project.json").write_text(
+            json.dumps({"work_dir": work_dir}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        p = proj_dir / f"{session_id}.jsonl"
+        _jsonl(
+            p,
+            [
+                {"type": "user", "session_id": session_id, "cwd": work_dir, "content": user_msg},
+                {"type": "assistant", "session_id": session_id, "cwd": work_dir, "content": asst_msg},
+            ],
+        )
+        if source is not None:
+            p.with_name(f"{session_id}.meta.json").write_text(
+                json.dumps({"source": source, "origin": source}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        os.utime(p, (mtime, mtime))
+        return p
+
+    cli_p = write_session("default/proj-app", "uuid-cli-1", "CLI 提问", "CLI 回答", source="cli", mtime=1_794_400_010)
+    web_p = write_session("default/proj-app", "s_webdesktop1", "Web/Desktop 提问", "Web/Desktop 回答", source="gateway", mtime=1_794_400_020)
+    # Stale WeChat transcript under another account + active WeChat transcript under default.
+    im_sid = "agent:main:wechat:o9cq8035@im.wechat"
+    write_session("llli/proj-app", im_sid, "旧微信消息", "旧回答", source="wechat", mtime=1_780_000_000)
+    im_active = write_session("default/proj-app", im_sid, "新微信消息", "新回答", source="gateway", mtime=1_794_400_030)
+    # Web session that moved from /w/tmp to /w/app.
+    write_session("default/proj-tmp", "s_moved", "旧目录", "旧目录回答", source="gateway", work_dir="/w/tmp", mtime=1_794_400_005)
+    moved_active = write_session("default/proj-app", "s_moved", "新目录", "新目录回答", source="gateway", work_dir="/w/app", mtime=1_794_400_040)
+    # Pure SDK session -> must NOT be discovered, located, or scanned!
+    sdk_p = write_session("default/proj-sdk", "uuid-sdk-1", "1+1? 只回答数字", "2", source="sdk", mtime=1_794_400_050)
+
+    discovered = SOURCE_SPECS["agentica"].discover(ag_root)
+    assert sdk_p not in discovered
+    assert {cli_p, web_p, im_active, moved_active} <= set(discovered)
+
+    assert locate_transcript("agentica", {"session_id": im_sid, "cwd": "/w/app"}, roots=roots) == im_active
+    assert locate_transcript("agentica", {"session_id": "s_moved", "cwd": "/w/app"}, roots=roots) == moved_active
+    assert locate_transcript("agentica", {"session_id": "uuid-sdk-1", "cwd": "/w/app"}, roots=roots) is None
+    assert locate_transcript("agentica", {"transcript_path": str(sdk_p)}, roots=roots) is None
+
+    written: list[dict] = []
+
+    class RecordingWriter:
+        async def write(self, **kwargs):
+            written.append(kwargs)
+            return {"status": "pending"}
+
+    summary = await scan_sources(
+        RecordingWriter(),
+        hub_dir=hub,
+        sources=["agentica"],
+        roots=roots,
+        idle_seconds=0,
+    )
+    assert summary["agentica"]["errors"] == 0
+    sids = {w["session_id"] for w in written}
+    assert "agentica:uuid-cli-1" in sids
+    assert "agentica:s_webdesktop1" in sids
+    assert f"agentica:{im_sid}" in sids
+    assert "agentica:uuid-sdk-1" not in sids
+
 
 
 
