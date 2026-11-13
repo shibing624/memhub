@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "memhub"
 version = "0.2.4"
-description = "MemHub: Personal Memory Hub & Dual-System Layered Memory SDK for AI Agents"
+description = "Local-first personal memory hub & versioned dual-system memory SDK for AI agents (18 coding tools + Python SDK / MCP / REST)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
