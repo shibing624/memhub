@@ -609,9 +609,9 @@ function detail(row) {
       `<details class="src"><summary>${esc(day(s.at))} · ${esc(title(s))}</summary><pre>${esc(s.content)}</pre></details>`
     ).join("");
   }
-  if (row.is_latest && row.kind !== "raw") {
+  if (row.is_latest) {
     html += `<div class="actions">
-      <button data-edit="${esc(row.id)}">编辑</button>
+      ${row.kind !== "raw" ? `<button data-edit="${esc(row.id)}">编辑</button>` : ""}
       <button class="danger" data-del="${esc(row.id)}">删除</button>
     </div>`;
   }

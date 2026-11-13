@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **修复 Agentica 后台任务 / 子智能体 / 定时任务自动回报被当作用户原始对话写入记忆，并支持归档删除 `L0_RAW` 退出对话召回**：
+  - `_parse_agentica` 识别会话 JSONL 行上的结构化标记 `automated: true` 与 `cron_job`：整轮跳过后台命令完成回执（如 `execute(background=True)` / `agentica watch`）、`delegate` 子会话回报、peer 会话投递及定时任务触发轮次（同时抑制该自动轮次内的 `tool` / `assistant` 记录，防止串入并覆盖上一轮真人对话的回答；运行中途不带 `automated` 的真人 `steer: true` 插话照常保留，带 `automated: true` 的插话单条忽略）。
+  - `_AGENTICA_EXCLUDED_SOURCES` 在 `sdk` / `subagent` 基础上补齐 `cron` / `workflow`，排除非人类发起的定时与工作流会话文件；同时剥离 `/compact` 与自动切窗口注入的 `<context_window>`、`<session_notes>`、`<dropped_span>` 上下文块，只保留折叠在后面的真人提问。
+  - `Reader.search_conversation` 过滤 `latest_only=True`，`GET /v1/hub/conversations/{source_id}` 展开同会话前后轮时排除已归档退役的 `L0_RAW`，且 `/ui` 原始对话卡片支持点击「删除」直接退役脏 `L0_RAW`，删除后不再进入历史对话召回。
 - **召回不再每次全量读库**：BM25 词法召回改为按记忆域建倒排索引（`LexicalIndex`，打分与原全量 BM25+ 逐位一致），项目视图按 workspace 缓存；两者都以记忆库的写入计数（`generation`，存在共享 journal 里，本地写、跨设备同步、其他进程写入都会递增）为失效键，写入后下一次召回即可见。本机 5.6k 条记忆实测，稳态召回 0.70s → 0.17s。
 - **`memhub doctor` 新增 `Recall latency` 检查项**：报告当前记忆条数和最近一次召回耗时，超过 3s 告警；`/v1/hub/status` 新增 `recall` 字段。
 - **修复长编码会话写入反复失败 `CodingDecisionError: coding extraction requires a {"candidates": [...]} object`**：根因不是输入超长，而是**输出**被截断。会话里可沉淀的工程经验多时，抽取回复写到 `max_tokens`（默认 4096，部分网关上限也是 4096）就被截断，残缺 JSON 解析为空，再按"空结果"重试仍被截断，最后报错；写入任务重试 9 次后进入 failed。现在 `LLMClient.chat_json` 识别 `finish_reason == "length"` 并抛 `LLMOutputTruncatedError`（不再把截断当空结果重试），procedure 抽取器收到后在最近的用户轮次处把对话一分为二，分别抽取再合并；用一条 329 条消息的真实失败会话验证，由失败变为 3 次调用产出 5 条 procedure。

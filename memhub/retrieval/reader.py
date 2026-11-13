@@ -119,7 +119,7 @@ class Reader:
     ) -> SearchMemories:
         """Recall L0_RAW (retained source history) as evidence. Never mixed into default search."""
         query_embedding = await self.factory.embed.embed(query)
-        where = build_filter(
+        when = build_filter(
             app_ids=app_ids,
             user_id=user_id,
             agent_ids=agent_ids,
@@ -127,12 +127,13 @@ class Reader:
             layers=[Layer.L0_RAW],
             statuses=[MemoryStatus.ACTIVE],
             created_after=created_after,
+            latest_only=True,
         )
         top_k = max(limit, 10)
         nodes = await asyncio.to_thread(
             self.factory.vector.query,
             embedding=query_embedding,
-            where=where,
+            where=when,
             top_k=top_k,
         )
         items: list[MemoryItem] = []

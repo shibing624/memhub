@@ -3847,6 +3847,284 @@ console.log("UI_SOURCE_FILTER_OK");
     assert "UI_SOURCE_FILTER_OK" in proc.stdout
 
 
+async def test_agentica_skips_automated_turns_cron_sources_and_compact_preambles(
+    tmp_path: Path,
+) -> None:
+    """Agentica reader skips ``automated: true`` / ``cron_job`` turns (without leaking
+    their tool/assistant output onto adjacent human turns), excludes ``cron`` /
+    ``workflow`` session sidecars, keeps human ``steer`` messages, and strips
+    ``<context_window>`` / ``<session_notes>`` / ``<dropped_span>`` preambles."""
+    hub = tmp_path / "hub"
+    home = tmp_path / "home"
+    roots = default_source_roots(home)
+    ag_root = roots["agentica"] / "default" / "proj-memhub"
+    ag_root.mkdir(parents=True, exist_ok=True)
+    (ag_root / "project.json").write_text(
+        json.dumps({"work_dir": "/w/memhub"}, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # 1) Cron and workflow session sidecars are excluded at discovery and locate time.
+    for kind in ("cron", "workflow"):
+        side_p = ag_root / f"sched-{kind}.jsonl"
+        _jsonl(
+            side_p,
+            [
+                {"type": "user", "session_id": f"sched-{kind}", "content": "定时巡检任务"},
+                {"type": "assistant", "session_id": f"sched-{kind}", "content": "巡检通过"},
+            ],
+        )
+        side_p.with_name(f"sched-{kind}.meta.json").write_text(
+            json.dumps({"source": kind, "origin": kind}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        assert locate_transcript("agentica", {"session_id": f"sched-{kind}"}, roots=roots) is None
+        assert locate_transcript("agentica", {"transcript_path": str(side_p)}, roots=roots) is None
+
+    # 2) Mixed interactive session: human turn + human steer + automated mid-turn steer
+    #    + automated background terminal completion turn + cron_job turn + /compact window
+    #    preamble (both standalone and folded in front of a human question).
+    mixed_sid = "308a8306-mixed"
+    mixed_p = ag_root / f"{mixed_sid}.jsonl"
+    mixed_p.with_name(f"{mixed_sid}.meta.json").write_text(
+        json.dumps({"source": "gateway", "origin": "gateway"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    idle_preamble = (
+        "<context_window>\nCurrent context window 1.\nYou have 512000 tokens left in this context window.\n"
+        "</context_window>\n\n"
+        '<session_notes path="/tmp/s.notes.md">\n## 已完成事项\n- 旧窗口总结\n</session_notes>\n\n'
+        "<dropped_span>\n# Dropped span\n- user: old\n</dropped_span>\n\n"
+        "New context window started. Continue from session notes and search_session."
+    )
+    _jsonl(
+        mixed_p,
+        [
+            # Turn 1: human question + human steer + automated steer (ignored) + assistant answer
+            {
+                "type": "user",
+                "session_id": mixed_sid,
+                "cwd": "/w/memhub",
+                "git_branch": "main",
+                "timestamp": "2026-11-13T03:50:00.000Z",
+                "content": "把 gpt-6.1-sol 换成 gpt-5.4",
+            },
+            {
+                "type": "user",
+                "session_id": mixed_sid,
+                "timestamp": "2026-11-13T03:51:00.000Z",
+                "steer": True,
+                "content": "限流控制在 45 QPM",
+            },
+            {
+                "type": "user",
+                "session_id": mixed_sid,
+                "timestamp": "2026-11-13T03:51:30.000Z",
+                "steer": True,
+                "automated": True,
+                "content": "[Background terminal #10 finished: exit 0]",
+            },
+            {
+                "type": "assistant",
+                "session_id": mixed_sid,
+                "timestamp": "2026-11-13T03:54:35.000Z",
+                "content": "已切换为 gpt-5.4 并按 45 QPM 限流。",
+            },
+            # Automated turn A: background terminal completion + tool call + tool error + assistant reply
+            # Must NOT become its own turn AND must NOT overwrite Turn 1's assistant answer!
+            {
+                "type": "user",
+                "session_id": mixed_sid,
+                "cwd": "/w/memhub",
+                "git_branch": "main",
+                "timestamp": "2026-11-13T03:54:36.274Z",
+                "automated": True,
+                "content": (
+                    "[Background terminal #11 (term_11) failed: exit 143 after 50m37s]\n"
+                    "Command: agentica watch --interval 120 --done '~/.ssh/gpu_bg.sh done gpu4 v6_readers_cheap'\n"
+                    "This is an automatic report of a command you started in the background."
+                ),
+            },
+            {
+                "type": "assistant",
+                "session_id": mixed_sid,
+                "timestamp": "2026-11-13T03:54:40.000Z",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_auto_1",
+                        "type": "function",
+                        "function": {"name": "execute", "arguments": '{"command": "ls /tmp/auto"}'},
+                    }
+                ],
+            },
+            {
+                "type": "tool",
+                "session_id": mixed_sid,
+                "tool_call_id": "call_auto_1",
+                "name": "execute",
+                "timestamp": "2026-11-13T03:54:41.000Z",
+                "is_error": True,
+                "content": "Exit code: 143\nterminated",
+            },
+            {
+                "type": "assistant",
+                "session_id": mixed_sid,
+                "timestamp": "2026-11-13T03:54:46.674Z",
+                "content": "这条失败通知不用管，exit 143 是主动停掉的。",
+            },
+            # Automated turn B: scheduled task delivered into a gateway session
+            {
+                "type": "user",
+                "session_id": mixed_sid,
+                "timestamp": "2026-11-13T04:00:00.000Z",
+                "automated": True,
+                "cron_job": {"id": "4b11381e36dd", "name": "每日 CI 巡检"},
+                "content": '[Scheduled task “每日 CI 巡检” (4b11381e36dd)]\n每天巡检 GitHub Actions',
+            },
+            {
+                "type": "assistant",
+                "session_id": mixed_sid,
+                "timestamp": "2026-11-13T04:00:10.000Z",
+                "content": "[NO_UPDATE]",
+            },
+            # Standalone /compact window preamble row (no user prose) -> completely dropped
+            {
+                "type": "user",
+                "session_id": mixed_sid,
+                "timestamp": "2026-11-13T04:05:00.000Z",
+                "content": idle_preamble,
+            },
+            # Turn 2: auto-compact folded window preamble + real human question
+            {
+                "type": "user",
+                "session_id": mixed_sid,
+                "timestamp": "2026-11-13T04:06:00.000Z",
+                "content": f"{idle_preamble}\n\n费用列单独在论文正文说明，不放进主表。",
+            },
+            {
+                "type": "assistant",
+                "session_id": mixed_sid,
+                "timestamp": "2026-11-13T04:06:20.000Z",
+                "content": "好的，表格已去掉费用列，改为正文单独说明。",
+            },
+        ],
+    )
+    os.utime(mixed_p, (1_794_500_000, 1_794_500_000))
+
+    discovered = SOURCE_SPECS["agentica"].discover(roots["agentica"])
+    assert discovered == [mixed_p]
+
+    written: list[dict] = []
+
+    class RecordingWriter:
+        async def write(self, **kwargs):
+            written.append(kwargs)
+            return {"status": "pending"}
+
+    summary = await scan_sources(
+        RecordingWriter(),
+        hub_dir=hub,
+        sources=["agentica"],
+        roots=roots,
+        idle_seconds=0,
+        batch_turns=1,
+    )
+    assert summary["agentica"] == {"files": 1, "turns": 2, "errors": 0}
+    assert len(written) == 2
+
+    t1_msgs = written[0]["messages"]
+    assert t1_msgs == [
+        {"role": "user", "content": "把 gpt-6.1-sol 换成 gpt-5.4\n限流控制在 45 QPM"},
+        {"role": "assistant", "content": "已切换为 gpt-5.4 并按 45 QPM 限流。"},
+    ]
+    assert "tool_signals" not in written[0]
+
+    t2_msgs = written[1]["messages"]
+    assert t2_msgs == [
+        {"role": "user", "content": "费用列单独在论文正文说明，不放进主表。"},
+        {"role": "assistant", "content": "好的，表格已去掉费用列，改为正文单独说明。"},
+    ]
+    for w in written:
+        flat = json.dumps(w["messages"], ensure_ascii=False)
+        assert "Background terminal" not in flat
+        assert "Scheduled task" not in flat
+        assert "<context_window>" not in flat
+        assert "<session_notes" not in flat
+        assert "<dropped_span>" not in flat
+
+
+async def test_deleted_l0_raw_excluded_from_conversation_recall_and_context_peers(
+    tmp_path: Path,
+) -> None:
+    """Archiving an L0_RAW via ``DELETE /v1/hub/memories/{id}`` removes it from
+    ``search_conversation`` / ``/v1/hub/recall`` and from surrounding ``context_turns``."""
+    from memhub import MemoryClient
+    from memhub.config import Settings
+    from memhub.hub.client import HubClient
+    from memhub.hub.server import create_hub_app
+    from tests.conftest import FakeEmbedService, FakeLLMClient
+
+    client = MemoryClient(
+        settings=Settings(storage_dir=str(tmp_path / "store"), mode="system1", embed_dim=16),
+        embed=FakeEmbedService(dim=16),
+        llm=FakeLLMClient(responses=[{"memories": []}, {"memories": []}]),
+        jev=FakeLLMClient(responses=[]),
+    )
+    app = create_hub_app(
+        api_key="tok",
+        hub_dir=tmp_path / "hub",
+        client=client,
+        settings=client.settings,
+    )
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with (
+            HubClient(base_url="http://hub", api_key="tok", transport=transport) as hub,
+            httpx.AsyncClient(
+                transport=transport,
+                base_url="http://hub",
+                headers={"Authorization": "Bearer tok"},
+            ) as http,
+        ):
+            r1 = await hub.write(
+                messages=[
+                    {"role": "user", "content": "真人提问：把读者模型换成 gpt-5.4"},
+                    {"role": "assistant", "content": "已切换为 gpt-5.4"},
+                ],
+                session_id="agentica:s-clean",
+                request_id="req-clean-1",
+                raw_only=True,
+                wait=True,
+            )
+            r2 = await hub.write(
+                messages=[
+                    {"role": "user", "content": "[Background terminal #11 failed: exit 143]"},
+                    {"role": "assistant", "content": "不用管"},
+                ],
+                session_id="agentica:s-clean",
+                request_id="req-clean-2",
+                raw_only=True,
+                wait=True,
+            )
+            human_l0 = r1["result"]["memory_id"]
+            dirty_l0 = r2["result"]["memory_id"]
+
+            # Delete the polluted L0_RAW row via the same endpoint /ui calls.
+            del_resp = await http.delete(f"/v1/hub/memories/{dirty_l0}")
+            assert del_resp.status_code == 200 and del_resp.json()["success"] is True
+
+            recalled = await hub.recall(query="Background terminal #11 gpt-5.4", raw_limit=5)
+            conv_ids = {c["memory_id"] for c in recalled["conversations"]}
+            assert human_l0 in conv_ids
+            assert dirty_l0 not in conv_ids
+
+            expanded = await hub.get_conversation(human_l0[:8], context_turns=2)
+            peer_ids = {c["memory_id"] for c in expanded["conversations"]}
+            assert peer_ids == {human_l0}
+
+
+
+
 
 
 

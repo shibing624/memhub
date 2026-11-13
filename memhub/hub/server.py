@@ -685,6 +685,7 @@ def create_hub_app(
                 ),
                 None,
             )
+            peers = [p for p in peers if p.is_latest or p.node_id == anchor.node_id]
             selected = sorted(
                 peers,
                 key=lambda n: (n.memory_at or n.gmt_created or 0, n.node_id),

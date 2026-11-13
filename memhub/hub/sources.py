@@ -101,6 +101,15 @@ _CODEBUDDY_MARKUP = (
     "conversation_history_summary",
     "task-notification",
 )
+# Harness markup Agentica writes into user records on context-window cuts / budget reminders.
+_AGENTICA_MARKUP = (
+    "context_window",
+    "session_notes",
+    "dropped_span",
+)
+_AGENTICA_WINDOW_MARK = (
+    "New context window started. Continue from session notes and search_session."
+)
 _CURSOR_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL)
 # Cursor stamps each prompt: ``<timestamp>Wednesday, Oct 14, 2026, 1:16 PM (UTC+8)</timestamp>``.
 _CURSOR_TIME_RE = re.compile(
@@ -262,6 +271,14 @@ def _error_preview(raw: Any) -> str:
     return joined[:199] + "…" if len(joined) > 200 else joined
 
 
+def _strip_agentica_markup(text: str) -> str:
+    """Strip Agentica context-window preamble blocks while keeping any folded user prose."""
+    if not any(f"<{tag}" in text for tag in _AGENTICA_MARKUP):
+        return text
+    stripped = _strip_tags(text, _AGENTICA_MARKUP)
+    return stripped.replace(_AGENTICA_WINDOW_MARK, "")
+
+
 def _parse_agentica(record: dict, state: dict) -> tuple[str, str, str, int | None] | None:
     kind = record.get("type")
     if kind not in ("user", "assistant", "tool"):
@@ -272,6 +289,18 @@ def _parse_agentica(record: dict, state: dict) -> tuple[str, str, str, int | Non
         state["branch"] = record["git_branch"]
     session_id = record.get("session_id") or state["session_id"]
     at = _iso_seconds(record.get("timestamp"))
+    if kind == "user":
+        if record.get("automated") is True or record.get("cron_job") is not None:
+            if not record.get("steer"):
+                state["automated_turn"] = True
+            return None
+        text = _strip_agentica_markup(_blocks_text(record.get("content")))
+        if not _clean_text(text):
+            return None
+        state["automated_turn"] = False
+        return "user", text, session_id, at
+    if state.get("automated_turn"):
+        return None
     if kind == "tool":
         raw_out = _blocks_text(record.get("content")) or record.get("content") or record.get("output")
         is_err = (
@@ -1125,12 +1154,13 @@ class SourceSpec:
     read: Callable[[Path, int], tuple[list[Message], int]]
 
 
-_AGENTICA_EXCLUDED_SOURCES = frozenset({"sdk", "subagent"})
+_AGENTICA_EXCLUDED_SOURCES = frozenset({"sdk", "subagent", "cron", "workflow"})
 
 
 def _is_agentica_excluded(path: Path) -> bool:
-    """True when ``<session>.meta.json`` marks the transcript as SDK or subagent.
+    """True when ``<session>.meta.json`` marks a non-human RunSource.
 
+    SDK, subagent, cron, and workflow runs are machine-driven and excluded;
     CLI, Web, Desktop, and IM transcripts (``cli``, ``gateway``, channel names, or
     legacy transcripts without a sidecar) belong to the user and are ingested.
     """
