@@ -1233,6 +1233,41 @@ def test_install_uninstall_hosts_use_local_proxy(tmp_path: Path, monkeypatch) ->
     assert (home / ".kimi" / "config.toml").read_text().strip() == kimi_before.strip()
 
 
+def test_toml_mcp_absorbs_bare_memhub_table(tmp_path: Path) -> None:
+    # A ``[mcp_servers.memhub]`` table written by hand or ``codex mcp add``
+    # lives outside the marked block; installing next to it duplicated the
+    # table and Codex rejected the whole config.toml with "duplicate key".
+    from memhub.hub.hosts import Launch, TomlMcp
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        'model = "gpt-5"\n'
+        "\n"
+        "[mcp_servers.memhub]\n"
+        'command = "/old/bin/python"\n'
+        'args = ["-m", "memhub.hub.mcp"]\n'
+        "\n"
+        "[mcp_servers.memhub.tools.search]\n"
+        'approval_mode = "approve"\n'
+        "\n"
+        "[mcp_servers.other]\n"
+        'command = "/bin/other"\n'
+    )
+    launch = Launch(host="codex", hub_dir=tmp_path / "hub")
+    TomlMcp().install(cfg, launch)
+    text = cfg.read_text()
+    data = tomllib.loads(text)  # a duplicate table would raise here
+    assert list(data["mcp_servers"]) == ["other", "memhub"]
+    assert data["mcp_servers"]["memhub"]["args"][:2] == ["-m", "memhub.hub.mcp"]
+    assert data["mcp_servers"]["other"]["command"] == "/bin/other"
+    assert data["model"] == "gpt-5"
+    assert text.count("[mcp_servers.memhub]") == 1
+    # Reinstalling stays idempotent.
+    TomlMcp().install(cfg, launch)
+    again = tomllib.loads(cfg.read_text())
+    assert list(again["mcp_servers"]) == ["other", "memhub"]
+
+
 def test_agentica_yaml_install_keeps_comments_and_uninstall_restores_bytes(
     tmp_path: Path,
 ) -> None:

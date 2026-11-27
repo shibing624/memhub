@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **修复 Codex `config.toml` 出现两份 `[mcp_servers.memhub]` 导致无法启动**：手工写入或 `codex mcp add` 注册的同名裸表在安装器标记块之外，安装/升级时安装器只替换自己的标记块、感知不到裸表，文件里出现重复表后 Codex 拒绝解析整个配置（报 `duplicate key`），对话中断且重启后无法启动。`TomlMcp.install` 现在先把标记块外的同名表（含子表）吸收掉再写入标记块，保证同名 server 只注册一次，其余内容保持字节不变。新增回归测试。
 - **`memhub doctor` 输出精简**：`DSH capture` 只在监听失败时告警（健康或未启用不再占一行，状态仍可在 `memhub status` 查看）；健康时 `Detected hosts` 只显示接入数，不再列出全部宿主名，异常时仍列未接入名单；召回分桶只在有样本时分别报告，全无样本时收成一行 `Recall latency`。
 
 ## [0.2.5] — 2026-11-22
