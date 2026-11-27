@@ -229,9 +229,20 @@ class TomlMcp:
     """Codex ``config.toml``: a marked block, so the rest of the file stays byte-identical."""
 
     _block = re.compile(rf"\n?{re.escape(TOML_BEGIN)}.*?{re.escape(TOML_END)}\n", re.DOTALL)
+    # A ``[mcp_servers.memhub]`` table written by hand or by ``codex mcp add``
+    # lives outside our marked block, so reinstalling next to it duplicates the
+    # table and Codex then rejects the whole file ("duplicate key" at the
+    # second header). Absorb any bare table — and its sub-tables — into the
+    # marked block so the block stays the single registration.
+    _bare = re.compile(
+        rf"(?m)^[ \t]*\[[ \t]*mcp_servers\.(?:{re.escape(MCP_NAME)}|\"{re.escape(MCP_NAME)}\")"
+        rf"(?:\.[^\]\n]*)?\][^\S\n]*\n(?:^(?![ \t]*\[).*\n?)*"
+    )
 
     def install(self, path: Path, launch: Launch) -> None:
-        text = self._block.sub("", path.read_text(encoding="utf-8")) if path.is_file() else ""
+        text = ""
+        if path.is_file():
+            text = self._bare.sub("", self._block.sub("", path.read_text(encoding="utf-8")))
         mcp = launch.mcp()
         block = (
             f"{TOML_BEGIN}\n[mcp_servers.{MCP_NAME}]\n"
